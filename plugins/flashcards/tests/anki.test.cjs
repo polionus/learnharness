@@ -578,3 +578,79 @@ test('Flashcards frontend exposes Anki panel, deck menu items, dialogs, and Anki
     h.dispose();
   }
 });
+
+test('Flashcards generation renders animated progress bar, chunk segments, elapsed timer, and live background activity', async () => {
+  const source = buildSync({
+    entryPoints: [path.join(__dirname, '../src/main.js')],
+    bundle: true,
+    platform: 'browser',
+    format: 'esm',
+    write: false,
+  }).outputFiles[0].text;
+  const moduleUrl = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
+  const document = createDocument();
+  const { activate: activateUi } = await import(moduleUrl);
+  const h = fixture(document);
+  activateUi(h.ctx);
+  h.mount();
+  await flush();
+  try {
+    h.state.batch = {
+      id: 'b-progress',
+      kind: 'graph',
+      status: 'running',
+      createdAt: Date.now() - 12000,
+      completed: 1,
+      total: 3,
+      added: 4,
+      failedTargetIds: [],
+      chunks: [
+        { id: 'c1', status: 'applied', targetIds: ['p1'], added: 4 },
+        { id: 'c2', status: 'running', targetIds: ['p2'], activity: 'tool: submit_result', turns: 2 },
+        { id: 'c3', status: 'queued', targetIds: ['p3'] },
+      ],
+    };
+    h.state.revision++;
+    h.notify();
+    await flush();
+
+    const panel = h.app.querySelector('.fc-batch');
+    assert.ok(panel);
+    assert.equal(panel.dataset.state, 'running');
+    const bar = panel.querySelector('[role=progressbar]');
+    assert.ok(bar);
+    assert.equal(bar.getAttribute('aria-valuemin'), '0');
+    assert.equal(bar.getAttribute('aria-valuemax'), '3');
+    assert.equal(bar.getAttribute('aria-valuenow'), '1');
+    assert.equal(bar.querySelector('.fc-progress-fill').style.width, '33%');
+    assert.ok(bar.querySelector('.fc-progress-indeterminate'), 'active generation shows animated working sheen');
+    assert.ok(panel.querySelector('.fc-batch-percent').textContent.includes('33%'));
+    assert.ok(panel.querySelector('.fc-batch-elapsed'), 'elapsed duration is displayed');
+    assert.ok(panel.querySelector('.fc-batch-activity').textContent.includes('Working in background'));
+    assert.ok(panel.querySelector('.fc-batch-activity').textContent.includes('submitting flashcards'));
+    const segments = [...panel.querySelectorAll('.fc-chunk-segment')];
+    assert.equal(segments.length, 3);
+    assert.deepEqual(segments.map(s => s.dataset.status), ['applied', 'running', 'queued']);
+
+    // Partial failure removes indeterminate animation and switches to failed state.
+    h.state.batch = {
+      ...h.state.batch,
+      status: 'partial',
+      completed: 3,
+      failedTargetIds: ['p2'],
+      chunks: [
+        { id: 'c1', status: 'applied', targetIds: ['p1'], added: 4 },
+        { id: 'c2', status: 'failed', targetIds: ['p2'], error: 'Timeout' },
+        { id: 'c3', status: 'applied', targetIds: ['p3'], added: 2 },
+      ],
+    };
+    h.state.revision++;
+    h.notify();
+    await flush();
+    const after = h.app.querySelector('.fc-batch');
+    assert.equal(after.dataset.state, 'failed');
+    assert.equal(after.querySelector('.fc-progress-indeterminate'), null);
+  } finally {
+    h.dispose();
+  }
+});

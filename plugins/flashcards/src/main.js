@@ -235,7 +235,12 @@ export function activate(ctx) {
     const guarded = action => async () => { try { await action(); } catch (cause) { showError(message(cause)); } };
     const review = createReviewController({ ctx, signal, button, markdown, onRated: () => { void refresh(); } });
     const practice = scope => review.openPractice(buildPracticeCards(snapshot, scope));
-    const pickerSlot = el('div', 'fc-picker'), fileInput = el('input'), fileStatus = el('p', 'fc-muted fc-file-status');
+    const pickerSlot = el('div', 'fc-picker'), fileInput = el('input'), fileStatusWrap = el('div', 'fc-file-status-wrap'), fileStatus = el('p', 'fc-muted fc-file-status'), fileProgress = el('div', 'fc-progress-track fc-file-progress');
+    fileProgress.setAttribute('role', 'progressbar');
+    fileProgress.setAttribute('aria-label', 'Preparing file for flashcard generation');
+    fileProgress.append(el('div', 'fc-progress-indeterminate'));
+    fileProgress.hidden = true;
+    fileStatusWrap.append(fileStatus, fileProgress);
     const canConvertFiles = typeof ctx.documents?.toMarkdown === 'function';
     fileInput.type = 'file'; fileInput.multiple = false; fileInput.hidden = true; fileInput.setAttribute('aria-label', 'Choose a file for flashcards');
     fileStatus.setAttribute('role', 'status');
@@ -244,6 +249,7 @@ export function activate(ctx) {
       const busy = filePreparing || !!activeBatch(snapshot?.batch);
       generationButton?.update({ disabled: !generationIds.length || busy });
       fileButton?.update({ disabled: !canConvertFiles || busy });
+      fileProgress.hidden = !filePreparing;
     }
     const picker = widget(ctx.ui.mountKnowledgePicker(pickerSlot, { value: generationIds, onChange: ids => {
       generationIds = [...ids]; picker.update({ value: generationIds }); updateGenerationButtons();
@@ -315,7 +321,7 @@ export function activate(ctx) {
       onImported: (nextState, note, deckId) => { ankiNotice = note; publish(nextState); updateAnkiPanel(nextState); if (deckId) revealDeck(deckId); },
     }), signal);
     const dashboardSlot = el('div', 'fc-dashboard-slot');
-    root.append(toolbar, fileStatus, error, batchArea, deckPanel, ankiPanel, dashboardSlot); container.append(root);
+    root.append(toolbar, fileStatusWrap, error, batchArea, deckPanel, ankiPanel, dashboardSlot); container.append(root);
     const dashboard = mountDashboard({ container: dashboardSlot, signal });
     tree = mountLibraryTree({ ctx, container: treeSlot, signal, button,
       onReview: scope => review.open(scope), onPreview: (p, cue, archive) => previewCue(p, cue, archive, signal),
@@ -364,20 +370,120 @@ export function activate(ctx) {
         if (!signal.aborted) confirmFileGeneration(preflight, [], signal, state => revealDeck(state.batch?.deckId));
       } catch (cause) { if (!signal.aborted) showError(message(cause)); }
     };
+    const formatElapsed = ms => {
+      const totalSec = Math.max(0, Math.floor(ms / 1000));
+      const mins = Math.floor(totalSec / 60), secs = totalSec % 60;
+      return mins > 0 ? `${mins}m ${String(secs).padStart(2, '0')}s` : `${secs}s`;
+    };
+    const describeActivity = activity => {
+      if (!activity) return '';
+      if (activity === 'starting' || activity === 'waiting') return 'generating flashcards';
+      if (activity === 'result accepted') return 'saving flashcards';
+      if (activity.startsWith('tool:')) {
+        const name = activity.slice(5).trim();
+        return name === 'submit_result' ? 'submitting flashcards' : `running ${name}`;
+      }
+      return activity;
+    };
     let batchScope = lifetime(signal);
     function renderBatch(batch) {
       batchScope.abort(); batchScope = lifetime(signal); batchArea.replaceChildren();
       const emptyFileResult = batch?.kind === 'file' && batch.status === 'completed' && batch.added === 0;
       if (!batch || (batch.status === 'completed' && !batch.error && !batch.chunks.some(chunk => chunk.error) && !emptyFileResult)) return;
-      const bs = batchScope.signal, panel = el('section', 'fc-batch'); batchArea.append(panel);
+      const bs = batchScope.signal, running = !!activeBatch(batch);
+      const chunks = Array.isArray(batch.chunks) ? batch.chunks : [];
+      const total = Math.max(1, batch.total || chunks.length || 1);
+      const completed = Math.min(total, Math.max(0, batch.completed || 0));
+      const inFlight = chunks.filter(c => ['running', 'saving', 'queued', 'pending'].includes(c.status));
+      const savingCount = chunks.filter(c => c.status === 'saving').length;
+      const runningCount = chunks.filter(c => c.status === 'running').length;
+      const queuedCount = chunks.filter(c => ['queued', 'pending'].includes(c.status)).length;
+      const failedCount = chunks.filter(c => ['failed', 'cancelled', 'interrupted'].includes(c.status)).length;
+      const percent = Math.round((completed / total) * 100);
+      const visualState = batch.status === 'cancelling' ? 'cancelling' : running ? 'running' : (failedCount > 0 || batch.error) ? 'failed' : 'completed';
+
+      const panel = el('section', 'fc-batch');
+      panel.dataset.state = visualState;
+      panel.setAttribute('aria-live', 'polite');
+      batchArea.append(panel);
+
       if (batch.kind === 'file') panel.append(el('p', 'fc-muted fc-file-name', batch.name));
-      panel.append(el('p', '', `Generation: ${batch.status} · ${batch.completed}/${batch.total} chunks · ${batch.added} cues added`));
+
+      const header = el('div', 'fc-batch-header');
+      const titleGroup = el('div', 'fc-batch-title-group');
+      const dot = el('span', 'fc-batch-dot');
+      dot.setAttribute('aria-hidden', 'true');
+      const headline = el('p', 'fc-batch-headline', `Generation: ${batch.status} · ${batch.completed}/${batch.total} chunks · ${batch.added} cues added`);
+      titleGroup.append(dot, headline);
+      const meta = el('div', 'fc-batch-meta');
+      meta.append(el('span', 'fc-batch-percent', `${percent}%`));
+      if (running && Number.isFinite(batch.createdAt)) {
+        const elapsed = el('span', 'fc-muted fc-batch-elapsed', formatElapsed(Date.now() - batch.createdAt));
+        meta.append(elapsed);
+        const timer = setInterval(() => {
+          if (!bs.aborted) elapsed.textContent = formatElapsed(Date.now() - batch.createdAt);
+        }, 1000);
+        timer.unref?.();
+        bs.addEventListener('abort', () => clearInterval(timer), { once: true });
+      }
+      header.append(titleGroup, meta);
+      panel.append(header);
+
+      // Determinate progress bar with animated working sheen whenever a background worker is active.
+      const track = el('div', 'fc-progress-track');
+      track.setAttribute('role', 'progressbar');
+      track.setAttribute('aria-label', 'Flashcard generation progress');
+      track.setAttribute('aria-valuemin', '0');
+      track.setAttribute('aria-valuemax', String(total));
+      track.setAttribute('aria-valuenow', String(completed));
+      track.dataset.state = visualState;
+      const fill = el('div', 'fc-progress-fill');
+      fill.style.width = `${percent}%`;
+      track.append(fill);
+      if (running) {
+        const activeSheen = el('div', 'fc-progress-indeterminate');
+        track.append(activeSheen);
+      }
+      panel.append(track);
+
+      // Multi-chunk segmented breakdown bar for multi-chunk batches.
+      if (chunks.length > 1) {
+        const strip = el('div', 'fc-chunk-strip');
+        strip.setAttribute('aria-label', 'Chunk statuses');
+        chunks.forEach((chunk, index) => {
+          const seg = el('span', 'fc-chunk-segment');
+          seg.dataset.status = chunk.status || 'pending';
+          const act = describeActivity(chunk.activity);
+          seg.title = `Chunk ${index + 1}: ${chunk.status}${act ? ` (${act})` : ''}`;
+          strip.append(seg);
+        });
+        panel.append(strip);
+      }
+
+      if (running) {
+        const parts = [];
+        if (batch.status === 'cancelling') {
+          parts.push('Cancelling background workers…');
+        } else {
+          parts.push('Working in background');
+          const details = [];
+          if (savingCount) details.push(`${savingCount} saving`);
+          if (runningCount) details.push(`${runningCount} running`);
+          if (queuedCount) details.push(`${queuedCount} queued`);
+          if (details.length) parts.push(details.join(', '));
+          const activeLabel = inFlight.map(c => describeActivity(c.activity)).find(Boolean);
+          if (activeLabel) parts.push(activeLabel);
+          parts.push('You can keep studying or navigate away');
+        }
+        panel.append(el('p', 'fc-muted fc-batch-activity', parts.join(' · ')));
+      }
+
       if (emptyFileResult) panel.append(el('p', '', 'No flashcards were generated from this file.'));
-      for (const chunk of batch.chunks.filter(chunk => chunk.error)) panel.append(el('p', 'fc-error', `Chunk ${chunk.id}: ${chunk.error}`));
+      for (const chunk of chunks.filter(chunk => chunk.error)) panel.append(el('p', 'fc-error', `Chunk ${chunk.id}: ${chunk.error}`));
       if (batch.error) panel.append(el('p', 'fc-error', batch.error));
       const controls = el('div', 'fc-actions'); panel.append(controls);
-      if (activeBatch(batch)) button(controls, 'Cancel generation', guarded(() => mutate('cancel-generation', { batchId: batch.id }, signal)), bs);
-      if (!activeBatch(batch) && (batch.kind === 'file' ? batch.failedChunkIds?.length : batch.failedTargetIds?.length)) button(controls, 'Retry failed…', () => batch.kind === 'file' ? retryFileGeneration(batch.id) : confirmGeneration(batch.failedTargetIds, signal, showError), bs);
+      if (running) button(controls, 'Cancel generation', guarded(() => mutate('cancel-generation', { batchId: batch.id }, signal)), bs);
+      if (!running && (batch.kind === 'file' ? batch.failedChunkIds?.length : batch.failedTargetIds?.length)) button(controls, 'Retry failed…', () => batch.kind === 'file' ? retryFileGeneration(batch.id) : confirmGeneration(batch.failedTargetIds, signal, showError), bs);
       if (batch.error) button(controls, 'Retry saving', guarded(() => mutate('resume-results', {}, signal)), bs);
     }
     search.addEventListener('input', () => { if (snapshot) tree.update(snapshot, search.value); }, { signal });

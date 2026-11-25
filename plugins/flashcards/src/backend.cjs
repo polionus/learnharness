@@ -172,7 +172,17 @@ function activate(ctx) {
     const b = s.batches.at(-1);
     const batch = b ? { ...b, kind: b.kind ?? 'graph', chunks: b.chunks.map(c => {
       if (applicationErrors.has(c.id)) return { ...c, error: applicationErrors.get(c.id) };
-      if (['queued', 'running'].includes(c.status) && c.taskId) { try { const t = ctx.workers.get(c.taskId); return { ...c, status: t.status === 'succeeded' ? 'saving' : t.status }; } catch { /* keep durable application status */ } }
+      if (['queued', 'running'].includes(c.status) && c.taskId) {
+        try {
+          const t = ctx.workers.get(c.taskId);
+          return {
+            ...c,
+            status: t.status === 'succeeded' ? 'saving' : t.status,
+            ...(typeof t.activity === 'string' && t.activity ? { activity: t.activity } : {}),
+            ...(Number.isInteger(t.turns) && t.turns > 0 ? { turns: t.turns } : {}),
+          };
+        } catch { /* keep durable application status */ }
+      }
       return c;
     }), added: b.chunks.reduce((n, c) => n + (c.added || 0), 0), completed: b.chunks.filter(c => ['applied', 'failed', 'cancelled', 'interrupted'].includes(c.status)).length, total: b.chunks.length,
       failedTargetIds: b.chunks.filter(c => ['failed', 'cancelled', 'interrupted'].includes(c.status)).flatMap(c => c.targetIds ?? []),
