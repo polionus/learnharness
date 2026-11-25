@@ -18,7 +18,7 @@ const settingsIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 
 const plusIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
 
-export function mountLibraryTree({ ctx, container, signal, button, onReview, onPreview, onEdit, onDelete, onCreateCard, onCreateCue, onDeckSettings, onMemberships, onReorder, onRename, onSelection, onError }) {
+export function mountLibraryTree({ ctx, container, signal, button, onReview, onPreview, onEdit, onDelete, onCreateCard, onCreateCue, onDeckSettings, onExportDeck, onSyncDeck, onMemberships, onReorder, onRename, onSelection, onError }) {
   const viewport = el('div', 'fc-tree-viewport');
   const inner = el('div', 'fc-tree-inner');
   const empty = el('p', 'fc-muted');
@@ -64,6 +64,8 @@ export function mountLibraryTree({ ctx, container, signal, button, onReview, onP
     if (archive) return [];
     const items = kind === 'deck' ? [
       { key: 'settings', label: 'Deck settings', onSelect: run(() => onDeckSettings(record.deck)) },
+      ...(onExportDeck ? [{ key: 'anki-export', label: 'Export to Anki (.apkg)…', onSelect: run(() => onExportDeck(record.deck)) }] : []),
+      ...(onSyncDeck ? [{ key: 'anki-sync', label: 'Sync deck to Anki…', onSelect: run(() => onSyncDeck(record.deck)) }] : []),
     ]
       : kind === 'proposition' ? [{ key: 'memberships', label: 'Decks…', onSelect: run(() => onMemberships(record.p)) }]
       : [{ key: 'edit', label: 'Edit', onSelect: run(() => onEdit(record.p, record.cue)) }, { key: 'delete', label: 'Delete', disabled: ['running', 'cancelling'].includes(state.batch?.status), onSelect: run(() => onDelete(record.p, record.cue)) }];

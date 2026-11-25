@@ -1,6 +1,6 @@
 # Flashcards
 
-A Core LearnHarness plugin: generate fact-recall cues from your graph or uploaded PDF/text files, organize them in flat decks, and review them with FSRS-6. **No Anki integration.** No runtime npm dependencies, private app imports, core graph writes or provider credentials in the package.
+A Core LearnHarness plugin: generate fact-recall cues from your graph or uploaded PDF/text files, organize them in flat decks, review them with FSRS-6, and sync or exchange decks with **Anki** via standard `.apkg` packages and live **AnkiConnect** (add-on `2055492159`). No runtime npm dependencies, private app imports, core graph writes or provider credentials in the package.
 
 ## Core plugin and source reference
 
@@ -75,6 +75,20 @@ Uploading the same filename and exact converted content reopens the existing fil
 Conversion limits are 25 MiB per file, 26 MiB actual multipart body, 1,000 PDF pages and 2 MiB final UTF-8 Markdown including page markers; excess is refused, never silently truncated. The host allows one conversion at a time and reports busy instead of queuing. Cancellation is best-effort: input/page/output limits are **not** a hard CPU timeout or peak-memory bound, and an aborted conversion may hold the slot until the underlying parser stops. Before generation confirmation, leaving the view aborts conversion or ignores late preparation results.
 
 Only the converted Markdown is retained under plugin data for retry and repeat-file identification, not the original upload. This text and the duplicate-detection record belong to the file deck: keeping an empty deck keeps both, and identical uploads reopen it without regeneration; deleting that deck removes both, so a later upload can offer fresh generation. Moving its targets to other decks does not transfer ownership of the saved source text; those local targets remain usable after the original file deck is deleted. Normal background-task records also retain their generation inputs. Uploads do not create graph sources or trigger the graph extraction pipeline.
+
+### Anki integration
+
+The Anki panel below the deck list (and each deck's gear menu) supports two ways to train your LearnHarness flashcards with [Anki](https://github.com/ankitects/anki) without adding any runtime npm dependencies:
+
+1. **Portable `.apkg` export & import**:
+   - **Export .apkg…** packages all decks, the current selection, or a single deck into a standard Anki `.apkg` archive (`collection.anki2` + `media`) compatible with Anki Desktop, AnkiMobile, and AnkiDroid. Markdown and LaTeX math (`$...$` / `$$...$$`) convert cleanly to Anki HTML and MathJax (`\(...\)` / `\[...\]`). Optionally embeds FSRS-6 scheduling progress and uses deterministic note GUIDs so re-imports update cleanly instead of creating duplicates.
+   - **Import from Anki…** reads `.apkg` packages (including legacy `collection.anki2`, `collection.anki21`, and modern Anki 23.10+ zstd-compressed `collection.anki21b`, plus Basic, Reversed, and Cloze notes) as well as Anki text/TSV exports (`.txt`, `.tsv`). Imported cards stay live locally (`origin: "anki"`), participate in FSRS-6 review and statistics, and optionally import existing Anki scheduling progress.
+2. **Live AnkiConnect two-way sync**:
+   - Connects from the plugin backend to a running Anki Desktop instance with the [AnkiConnect](https://ankiweb.net/shared/info/2055492159) add-on (code `2055492159`, default `http://127.0.0.1:8765`, configurable URL, optional API key, and deck prefix in **Settings → Flashcards → Anki integration**).
+   - **Push to Anki** idempotently creates decks and the `LearnHarness Basic` note model, creates/updates notes without overwriting Anki's review schedule, moves cards when decks are renamed, and optionally triggers AnkiWeb sync.
+   - **Sync reviews from Anki** replays newer reviews completed in Anki Desktop or AnkiMobile into LearnHarness's FSRS-6 scheduler and 14-day activity chart.
+   - **Pull decks from Anki** imports selected Anki decks directly into LearnHarness.
+   - Optional **Auto-push new cards to Anki** automatically pushes newly generated, created, or edited cards to AnkiConnect in the background without blocking local operations.
 
 ### Spaced-repetition overview
 

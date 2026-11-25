@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Native flashcards and spaced review for LearnHarness. No Anki integration.",
+  "description": "Flashcards, FSRS-6 spaced repetition, and Anki integration (.apkg and AnkiConnect) for LearnHarness.",
   "license": "AGPL-3.0-only",
   "scripts": {
     "build": "node scripts/build.mjs",

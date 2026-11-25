@@ -1,10 +1,13 @@
 'use strict';
 const { randomUUID, createHash } = require('node:crypto');
 const path = require('node:path');
-const { openStore } = require('./store.cjs');
+const { openStore, defaults: defaultSettings } = require('./store.cjs');
 const scheduler = require('./scheduler.cjs');
 const { statistics } = require('./statistics.cjs');
 const fileGeneration = require('./file-generation.cjs');
+const ankiFormat = require('./anki-format.cjs');
+const ankiApkg = require('./anki-apkg.cjs');
+const ankiConnect = require('./anki-connect.cjs');
 
 const { graphInstructions: instructions, graphPromptFor: promptFor } = require('./generation-prompts.cjs');
 const resultSchema = {
@@ -18,12 +21,25 @@ const estimate = (input) => Math.ceil(Buffer.byteLength(instructions + JSON.stri
 const fingerprint = (input) => createHash('sha256').update(JSON.stringify(input)).digest('hex');
 const activeBatch = (s) => s.batches.findLast(b => ['running', 'cancelling'].includes(b.status));
 const memberships = (s, id) => s.decks.filter(d => d.propositionIds.includes(id)).map(d => d.id);
-const isLocal = p => p.origin === 'file' || p.origin === 'manual';
+const isLocal = p => p.origin === 'file' || p.origin === 'manual' || p.origin === 'anki';
 const reviewConfiguration = s => fingerprint({ retention: s.retention, learningSteps: s.learningSteps, relearningSteps: s.relearningSteps, dayStart: s.dayStart, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone });
 const fail = (message) => { throw new Error(message); };
 function requiredText(value, label) { if (typeof value !== 'string' || !value.trim()) fail(`${label} must not be blank.`); return value; }
+function resolveAnkiSettings(settings = {}) {
+  const base = defaultSettings();
+  return {
+    ankiUrl: typeof settings.ankiUrl === 'string' && settings.ankiUrl.trim() ? settings.ankiUrl : base.ankiUrl,
+    ankiApiKey: typeof settings.ankiApiKey === 'string' ? settings.ankiApiKey : base.ankiApiKey,
+    ankiDeckPrefix: typeof settings.ankiDeckPrefix === 'string' ? settings.ankiDeckPrefix : base.ankiDeckPrefix,
+    ankiIncludeScheduling: typeof settings.ankiIncludeScheduling === 'boolean' ? settings.ankiIncludeScheduling : base.ankiIncludeScheduling,
+    ankiAutoPush: typeof settings.ankiAutoPush === 'boolean' ? settings.ankiAutoPush : base.ankiAutoPush,
+  };
+}
 function validateSettings(patch, old) {
-  const allowed = new Set(['retention', 'learningSteps', 'relearningSteps', 'dayStart', 'chunkBudget', 'modelOverride', 'thinkingOverride']);
+  const allowed = new Set([
+    'retention', 'learningSteps', 'relearningSteps', 'dayStart', 'chunkBudget', 'modelOverride', 'thinkingOverride',
+    'ankiUrl', 'ankiApiKey', 'ankiDeckPrefix', 'ankiIncludeScheduling', 'ankiAutoPush',
+  ]);
   for (const key of Object.keys(patch)) if (!allowed.has(key)) fail(`Unsupported setting: ${key}`);
   const s = { ...old, ...patch };
   if (s.thinkingOverride === null) delete s.thinkingOverride;
@@ -35,6 +51,24 @@ function validateSettings(patch, old) {
   if (!Number.isSafeInteger(s.chunkBudget) || s.chunkBudget < 1) fail('Input budget must be a positive safe whole number.');
   if (s.modelOverride !== null && (!s.modelOverride || typeof s.modelOverride.provider !== 'string' || typeof s.modelOverride.id !== 'string')) fail('Invalid model override.');
   if (s.thinkingOverride !== undefined && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(s.thinkingOverride)) fail('Invalid thinking level.');
+  if (Object.hasOwn(patch, 'ankiUrl')) {
+    if (typeof s.ankiUrl !== 'string') fail('AnkiConnect URL must be a string.');
+    s.ankiUrl = ankiConnect.validateAnkiUrl(s.ankiUrl);
+  }
+  if (Object.hasOwn(patch, 'ankiApiKey')) {
+    if (typeof s.ankiApiKey !== 'string') fail('AnkiConnect API key must be a string.');
+    s.ankiApiKey = s.ankiApiKey.trim();
+  }
+  if (Object.hasOwn(patch, 'ankiDeckPrefix')) {
+    if (typeof s.ankiDeckPrefix !== 'string') fail('Anki deck prefix must be a string.');
+    s.ankiDeckPrefix = ankiFormat.normalizePrefix(s.ankiDeckPrefix);
+  }
+  if (Object.hasOwn(patch, 'ankiIncludeScheduling') && typeof s.ankiIncludeScheduling !== 'boolean') {
+    fail('Include scheduling must be a boolean.');
+  }
+  if (Object.hasOwn(patch, 'ankiAutoPush') && typeof s.ankiAutoPush !== 'boolean') {
+    fail('Auto-push to Anki must be a boolean.');
+  }
   return s;
 }
 function validateResult(result, context) {
@@ -99,7 +133,8 @@ function activate(ctx) {
   if (!ctx.workers?.register || !ctx.learning?.graph) fail('This app build does not provide the plugin capabilities required by Flashcards.');
   const store = openStore(ctx.dataDirectory);
   const preflights = new Map(), tickets = new Map(), observers = new Map(), applicationErrors = new Map();
-  let disposed = false, sourceCleanupError = null;
+  let disposed = false, sourceCleanupError = null, lastAutoPushError = null;
+  const ankiFetch = (...args) => (ctx.ankiFetch || globalThis.fetch)(...args);
   const alive = () => { if (disposed || ctx.signal.aborted) fail('Flashcards is disabled.'); };
   const notify = (topic = 'changed') => { if (!disposed && !ctx.signal.aborted) ctx.events.emit(topic); };
   function change(update, topic) { alive(); const result = store.change(update); notify(topic); return result; }
@@ -144,7 +179,14 @@ function activate(ctx) {
       ...(b.kind === 'file' ? { failedChunkIds: b.chunks.filter(c => ['failed', 'cancelled', 'interrupted'].includes(c.status)).map(c => c.id) } : {}),
       error: b.chunks.map(c => applicationErrors.get(c.id)).find(Boolean),
     } : null;
-    return { revision: s.revision, settings: s.settings, decks, propositions, batch, statistics: statistics(s, live, now), ...(sourceCleanupError ? { cleanupError: sourceCleanupError } : {}) };
+    const liveCues = propositions.filter(p => !p.archived).flatMap(p => p.cues.filter(c => !c.deleted));
+    const syncedCueCount = liveCues.filter(c => Number.isSafeInteger(c.anki?.noteId) && c.anki.noteId > 0).length;
+    const settings = { ...resolveAnkiSettings(s.settings), ...s.settings };
+    return {
+      revision: s.revision, settings, decks, propositions, batch, statistics: statistics(s, live, now),
+      anki: { syncedCueCount, totalCueCount: liveCues.length, lastSyncedAt: s.anki?.lastSyncedAt ?? null, ...(lastAutoPushError ? { autoPushError: lastAutoPushError } : {}) },
+      ...(sourceCleanupError ? { cleanupError: sourceCleanupError } : {}),
+    };
   }
   function finishBatch(s, b) {
     if (b.chunks.some(c => !['applied', 'failed', 'cancelled', 'interrupted'].includes(c.status))) return;
@@ -152,6 +194,7 @@ function activate(ctx) {
   }
   function applyOutcome(batchId, chunkId, task) {
     if (disposed || ctx.signal.aborted) return;
+    const touchedIds = new Set();
     try {
       change(s => {
         const b = s.batches.find(b => b.id === batchId), c = b?.chunks.find(c => c.id === chunkId);
@@ -169,7 +212,7 @@ function activate(ctx) {
             }
             const seen = new Set(p.cues.map(c => c.question.trim()));
             for (const card of row.cards) if (!seen.has(card.question.trim())) {
-              seen.add(card.question.trim()); p.cues.push({ id: randomUUID(), question: card.question, answer: card.answer, latestRating: null }); p.version++; added++;
+              seen.add(card.question.trim()); p.cues.push({ id: randomUUID(), question: card.question, answer: card.answer, latestRating: null }); p.version++; added++; touchedIds.add(p.id);
             }
           }
         } else for (const row of task.result.propositions) {
@@ -183,11 +226,12 @@ function activate(ctx) {
             p = { id: row.propositionId, origin: 'graph', name: source.node.name, statement: source.node.statement, snapshot: source.node, cues: [], schedule: scheduler.createSchedule(), firstReviewedAt: null, learningCueId: null, version: 0 };
             s.propositions[p.id] = p; destination.propositionIds.push(p.id);
           }
-          if (p) for (const card of additions) { p.cues.push({ id: randomUUID(), question: card.question, answer: card.answer, latestRating: null }); p.version++; added++; }
+          if (p) for (const card of additions) { p.cues.push({ id: randomUUID(), question: card.question, answer: card.answer, latestRating: null }); p.version++; added++; touchedIds.add(p.id); }
         }
         c.status = 'applied'; c.added = added; finishBatch(s, b);
       }, 'batch-changed');
       applicationErrors.delete(chunkId);
+      if (touchedIds.size) maybeAutoPush({ propositionIds: [...touchedIds] });
     } catch (error) { applicationErrors.set(chunkId, `Result could not be saved: ${error.message}`); notify('batch-changed'); }
   }
   function watch(batchId, chunkId, taskId) {
@@ -267,6 +311,7 @@ function activate(ctx) {
       s.creationReceipts.push({ requestId, hash, propositionId: p.id, cueId: cue.id });
       return { propositionId: p.id, cueId: cue.id };
     });
+    maybeAutoPush({ propositionIds: [created.propositionId], cueIds: [created.cueId] });
     return { state: view(), ...created };
   }
   register('create-card', input => createManualCard(input, true));
@@ -343,7 +388,9 @@ function activate(ctx) {
   });
   register('save-cue', ({ propositionId, cueId, question, answer, version }) => {
     requiredText(question, 'Question'); requiredText(answer, 'Answer');
-    change(s => { const p = prop(s, propositionId); if (p.version !== version) fail('This card changed elsewhere. Reload before saving.'); const c = p.cues.find(c => c.id === cueId && !c.deleted) ?? fail('Card not found.'); c.question = question; c.answer = answer; p.version++; }); return view();
+    change(s => { const p = prop(s, propositionId); if (p.version !== version) fail('This card changed elsewhere. Reload before saving.'); const c = p.cues.find(c => c.id === cueId && !c.deleted) ?? fail('Card not found.'); c.question = question; c.answer = answer; p.version++; });
+    maybeAutoPush({ propositionIds: [propositionId], cueIds: [cueId] });
+    return view();
   });
   register('delete-cue', ({ propositionId, cueId, version }) => {
     const p = prop(store.get(), propositionId);
@@ -564,6 +611,411 @@ function activate(ctx) {
     });
     tickets.delete(ticketId); return { ok: true };
   });
+
+  // ── Anki Integration (APKG export/import + AnkiConnect live sync) ──────────
+  function ankiConfig(settings) {
+    const resolved = resolveAnkiSettings(settings);
+    return {
+      url: resolved.ankiUrl,
+      apiKey: resolved.ankiApiKey,
+      deckPrefix: resolved.ankiDeckPrefix,
+      includeScheduling: resolved.ankiIncludeScheduling,
+      autoPush: resolved.ankiAutoPush,
+    };
+  }
+  function collectExportItems(s, scope = {}) {
+    const live = liveIds(s);
+    const { decks: selectedDecks, ids } = scopeIds(s, scope);
+    const allowedProps = new Set(ids);
+    const allowedCues = scope.cueIds !== undefined ? new Set(scope.cueIds) : null;
+    const seenCues = new Set();
+    const items = [];
+    for (const d of selectedDecks) {
+      for (const pid of d.propositionIds) {
+        if (!allowedProps.has(pid) || !live.has(pid)) continue;
+        const p = s.propositions[pid];
+        if (!p) continue;
+        for (const c of p.cues) {
+          if (c.deleted || seenCues.has(c.id)) continue;
+          if (allowedCues && !allowedCues.has(c.id)) continue;
+          seenCues.add(c.id);
+          items.push({ deckId: d.id, deckName: d.name, proposition: p, cue: c });
+        }
+      }
+    }
+    return items;
+  }
+  function applyAnkiMappings(mappings, syncedAt) {
+    if (!mappings.length && !syncedAt) return;
+    change(s => {
+      for (const entry of mappings) {
+        const p = s.propositions[entry.propositionId];
+        const c = p?.cues.find(x => x.id === entry.cueId);
+        if (c) c.anki = { ...(c.anki || {}), ...entry.anki };
+      }
+      if (syncedAt) s.anki = { ...(s.anki || {}), lastSyncedAt: syncedAt };
+    });
+  }
+  function upsertImportedCards(s, importedItems, { includeScheduling = true, now = Date.now() } = {}) {
+    const decksCreated = [];
+    const touchedDeckIds = new Set();
+    let cardsCreated = 0, cardsUpdated = 0, cardsSkipped = 0;
+
+    // Index existing cues by Anki guid / noteId+ord for idempotent re-imports.
+    const byGuid = new Map();
+    const byNoteOrd = new Map();
+    for (const p of Object.values(s.propositions)) {
+      for (const c of p.cues) {
+        if (c.deleted) continue;
+        if (c.anki?.guid) byGuid.set(c.anki.guid, { p, c });
+        if (Number.isSafeInteger(c.anki?.noteId)) byNoteOrd.set(`${c.anki.noteId}:${c.anki.ord ?? 0}`, { p, c });
+      }
+    }
+
+    const deckByName = new Map(s.decks.map(d => [d.name, d]));
+    const ensureDeck = name => {
+      const clean = String(name || 'Imported from Anki').trim() || 'Imported from Anki';
+      let d = deckByName.get(clean);
+      if (!d) {
+        d = { id: randomUUID(), name: clean, newLimit: 20, propositionIds: [] };
+        s.decks.push(d);
+        deckByName.set(clean, d);
+        decksCreated.push(d.id);
+      }
+      touchedDeckIds.add(d.id);
+      return d;
+    };
+
+    for (const item of importedItems) {
+      const question = String(item.question || '').trim();
+      const answer = String(item.answer || '').trim();
+      if (!question || !answer) continue;
+      const d = ensureDeck(item.deckName);
+      const match = (item.ankiGuid && byGuid.get(item.ankiGuid))
+        || (Number.isSafeInteger(item.ankiNoteId) && byNoteOrd.get(`${item.ankiNoteId}:${item.ankiOrd ?? 0}`))
+        || null;
+
+      if (match) {
+        let changed = false;
+        if (match.c.question !== question || match.c.answer !== answer) {
+          match.c.question = question;
+          match.c.answer = answer;
+          match.p.version++;
+          changed = true;
+        }
+        match.c.anki = {
+          ...(match.c.anki || {}),
+          ...(Number.isSafeInteger(item.ankiNoteId) ? { noteId: item.ankiNoteId } : {}),
+          ...(Number.isSafeInteger(item.ankiCardId) ? { cardId: item.ankiCardId } : {}),
+          ...(item.ankiGuid ? { guid: item.ankiGuid } : {}),
+          ...(item.ankiOrd !== undefined ? { ord: item.ankiOrd } : {}),
+          deckName: item.ankiDeckName || d.name,
+          syncedHash: ankiFormat.cueFingerprint(question, answer, match.p.name, item.ankiDeckName || d.name),
+          lastSyncedAt: now,
+        };
+        if (changed) cardsUpdated++; else cardsSkipped++;
+        continue;
+      }
+
+      // Skip exact-question duplicates inside the destination deck.
+      const duplicateInDeck = d.propositionIds.some(pid =>
+        s.propositions[pid]?.cues.some(c => !c.deleted && c.question.trim() === question)
+      );
+      if (duplicateInDeck) { cardsSkipped++; continue; }
+
+      const schedule = includeScheduling && item.schedule ? item.schedule : scheduler.createSchedule(now);
+      const propId = `anki:${randomUUID()}`;
+      const cueId = randomUUID();
+      const propName = String(item.name || question.split('\n')[0].slice(0, 80) || 'Anki card').trim();
+      const cue = {
+        id: cueId,
+        question,
+        answer,
+        latestRating: null,
+        anki: {
+          ...(Number.isSafeInteger(item.ankiNoteId) ? { noteId: item.ankiNoteId } : {}),
+          ...(Number.isSafeInteger(item.ankiCardId) ? { cardId: item.ankiCardId } : {}),
+          ...(item.ankiGuid ? { guid: item.ankiGuid } : {}),
+          ...(item.ankiOrd !== undefined ? { ord: item.ankiOrd } : {}),
+          deckName: item.ankiDeckName || d.name,
+          syncedHash: ankiFormat.cueFingerprint(question, answer, propName, item.ankiDeckName || d.name),
+          lastSyncedAt: now,
+        },
+      };
+      const p = {
+        id: propId,
+        origin: 'anki',
+        name: propName,
+        statement: '',
+        cues: [cue],
+        schedule,
+        firstReviewedAt: schedule.reps > 0 ? (schedule.last_review ?? now) : null,
+        learningCueId: [1, 3].includes(schedule.state) ? cueId : null,
+        version: 1,
+      };
+      s.propositions[propId] = p;
+      d.propositionIds.push(propId);
+      if (cue.anki.guid) byGuid.set(cue.anki.guid, { p, c: cue });
+      if (Number.isSafeInteger(cue.anki.noteId)) byNoteOrd.set(`${cue.anki.noteId}:${cue.anki.ord ?? 0}`, { p, c: cue });
+      cardsCreated++;
+    }
+
+    return { decksCreated: decksCreated.length, cardsCreated, cardsUpdated, cardsSkipped, deckIds: [...touchedDeckIds] };
+  }
+  function maybeAutoPush(scope) {
+    if (disposed || ctx.signal.aborted) return;
+    const s = store.get();
+    const cfg = ankiConfig(s.settings);
+    if (!cfg.autoPush) return;
+    const items = collectExportItems(s, scope);
+    if (!items.length) return;
+    void ankiConnect.pushToAnki({ items, config: cfg, syncAnkiWeb: false, fetchImpl: ankiFetch })
+      .then(result => {
+        if (disposed || ctx.signal.aborted) return;
+        lastAutoPushError = null;
+        applyAnkiMappings(result.mappings, result.syncedAt);
+      })
+      .catch(error => {
+        if (disposed || ctx.signal.aborted) return;
+        lastAutoPushError = error instanceof Error ? error.message : String(error);
+        notify('changed');
+      });
+  }
+
+  register('anki-status', async () => {
+    const s = store.get();
+    const status = await ankiConnect.checkStatus(ankiConfig(s.settings), ankiFetch);
+    const live = liveIds(s);
+    const liveCues = Object.values(s.propositions).filter(p => live.has(p.id)).flatMap(p => p.cues.filter(c => !c.deleted));
+    return {
+      ...status,
+      syncedCueCount: liveCues.filter(c => Number.isSafeInteger(c.anki?.noteId) && c.anki.noteId > 0).length,
+      totalCueCount: liveCues.length,
+      lastSyncedAt: s.anki?.lastSyncedAt ?? null,
+    };
+  });
+
+  register('anki-export-apkg', input => {
+    const s = store.get();
+    const cfg = ankiConfig(s.settings);
+    const scope = {
+      ...(input.deckIds !== undefined ? { deckIds: input.deckIds } : {}),
+      ...(input.propositionIds !== undefined ? { propositionIds: input.propositionIds } : {}),
+      ...(input.cueIds !== undefined ? { cueIds: input.cueIds } : {}),
+    };
+    const items = collectExportItems(s, scope);
+    if (!items.length) fail('There are no active flashcards in this selection to export.');
+    const includeScheduling = typeof input.includeScheduling === 'boolean' ? input.includeScheduling : cfg.includeScheduling;
+    const deckPrefix = typeof input.deckPrefix === 'string' ? ankiFormat.normalizePrefix(input.deckPrefix) : cfg.deckPrefix;
+    let filenameBase = 'LearnHarness-flashcards';
+    if (typeof input.filename === 'string' && input.filename.trim()) {
+      filenameBase = input.filename.trim().replace(/\.apkg$/i, '');
+    } else if (scope.deckIds?.length === 1) {
+      const single = s.decks.find(d => d.id === scope.deckIds[0]);
+      if (single) filenameBase = single.name;
+    }
+    const exported = ankiApkg.exportApkg({ items, deckPrefix, includeScheduling, filenameBase });
+    return {
+      filename: exported.filename,
+      base64: exported.buffer.toString('base64'),
+      deckCount: exported.deckCount,
+      noteCount: exported.noteCount,
+      cardCount: exported.cardCount,
+    };
+  });
+
+  register('anki-import', input => {
+    const filename = typeof input.filename === 'string' ? input.filename.trim() : '';
+    const s = store.get();
+    const cfg = ankiConfig(s.settings);
+    const includeScheduling = typeof input.includeScheduling === 'boolean' ? input.includeScheduling : cfg.includeScheduling;
+    const defaultDeckName = (typeof input.deckName === 'string' && input.deckName.trim())
+      ? input.deckName.trim()
+      : (filename ? filename.replace(/\.(apkg|txt|tsv|csv)$/i, '') : 'Imported from Anki');
+
+    let parsed;
+    if (typeof input.base64 === 'string' && input.base64.trim()) {
+      const bytes = Buffer.from(input.base64, 'base64');
+      if (!bytes.length) fail('The selected file is empty.');
+      const isZip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+      if (isZip || /\.apkg$/i.test(filename)) {
+        parsed = ankiApkg.importApkg(bytes, { deckPrefix: cfg.deckPrefix, includeScheduling, dayStart: s.settings.dayStart });
+      } else {
+        parsed = ankiApkg.importAnkiText(bytes.toString('utf8'), { defaultDeckName, deckPrefix: cfg.deckPrefix });
+      }
+    } else if (typeof input.text === 'string' && input.text.trim()) {
+      parsed = ankiApkg.importAnkiText(input.text, { defaultDeckName, deckPrefix: cfg.deckPrefix });
+    } else {
+      fail('Choose an Anki .apkg or text export file to import.');
+    }
+
+    if (!parsed.length) fail('No valid flashcards were found in that Anki file.');
+    const summary = change(state => upsertImportedCards(state, parsed, { includeScheduling }));
+    return { state: view(), summary };
+  });
+
+  register('anki-sync-push', async input => {
+    const s = store.get();
+    const cfg = ankiConfig(s.settings);
+    const scope = {
+      ...(input.deckIds !== undefined ? { deckIds: input.deckIds } : {}),
+      ...(input.propositionIds !== undefined ? { propositionIds: input.propositionIds } : {}),
+      ...(input.cueIds !== undefined ? { cueIds: input.cueIds } : {}),
+    };
+    const items = collectExportItems(s, scope);
+    if (!items.length) fail('There are no active flashcards in this selection to push to Anki.');
+    const result = await ankiConnect.pushToAnki({
+      items,
+      config: cfg,
+      syncAnkiWeb: Boolean(input.syncAnkiWeb),
+      fetchImpl: ankiFetch,
+    });
+    alive();
+    lastAutoPushError = null;
+    applyAnkiMappings(result.mappings, result.syncedAt);
+    return {
+      state: view(),
+      summary: {
+        created: result.created,
+        updated: result.updated,
+        unchanged: result.unchanged,
+        moved: result.moved,
+        failed: result.failed,
+        errors: result.errors,
+        ankiWebSynced: result.ankiWebSynced,
+        syncedAt: result.syncedAt,
+      },
+    };
+  });
+
+  register('anki-sync-pull', async input => {
+    const s = store.get();
+    const cfg = ankiConfig(s.settings);
+    const includeScheduling = typeof input.includeScheduling === 'boolean' ? input.includeScheduling : cfg.includeScheduling;
+    const imported = await ankiConnect.pullFromAnki({
+      deckNames: input.deckNames,
+      config: cfg,
+      includeScheduling,
+      dayStart: s.settings.dayStart,
+      fetchImpl: ankiFetch,
+    });
+    alive();
+    if (!imported.length) fail('No cards were found in the selected Anki deck(s).');
+    const now = Date.now();
+    const summary = change(state => {
+      const res = upsertImportedCards(state, imported, { includeScheduling, now });
+      state.anki = { ...(state.anki || {}), lastSyncedAt: now };
+      return res;
+    });
+    return { state: view(), summary };
+  });
+
+  register('anki-sync-reviews', async () => {
+    const s = store.get();
+    const cfg = ankiConfig(s.settings);
+    const live = liveIds(s);
+    const syncedCues = [];
+    for (const p of Object.values(s.propositions)) {
+      if (!live.has(p.id)) continue;
+      for (const c of p.cues) {
+        if (!c.deleted && Number.isSafeInteger(c.anki?.noteId) && c.anki.noteId > 0) {
+          syncedCues.push({ propositionId: p.id, cueId: c.id, noteId: c.anki.noteId });
+        }
+      }
+    }
+    if (!syncedCues.length) {
+      return { state: view(), summary: { cardsChecked: 0, reviewsApplied: 0, schedulesUpdated: 0, syncedAt: Date.now() } };
+    }
+    const { cardReviews, cardInfos, noteToCards } = await ankiConnect.fetchAnkiReviewUpdates({
+      syncedCues,
+      config: cfg,
+      fetchImpl: ankiFetch,
+    });
+    alive();
+    const now = Date.now();
+    let reviewsApplied = 0, schedulesUpdated = 0;
+
+    change(state => {
+      const seenAnkiReviews = new Set(state.reviews.map(r => r.ankiReviewId).filter(Boolean));
+      const byProp = new Map();
+      for (const entry of syncedCues) {
+        if (!byProp.has(entry.propositionId)) byProp.set(entry.propositionId, []);
+        byProp.get(entry.propositionId).push(entry);
+      }
+
+      for (const [propId, entries] of byProp) {
+        const p = state.propositions[propId];
+        if (!p) continue;
+        const lastLocalReview = p.schedule.last_review ?? 0;
+
+        // Gather all newer Anki revlog entries across this proposition's synced cues.
+        const freshReviews = [];
+        let fallbackCard = null;
+        for (const entry of entries) {
+          const cardIds = noteToCards.get(entry.noteId) || [];
+          for (const cid of cardIds) {
+            const info = cardInfos.get(cid);
+            if (info && (!fallbackCard || (info.reps ?? 0) > (fallbackCard.reps ?? 0))) fallbackCard = info;
+            const rows = cardReviews.get(cid) || [];
+            for (const row of rows) {
+              const revAt = Number(row.id);
+              const ease = Number(row.ease);
+              if (!Number.isFinite(revAt) || revAt <= lastLocalReview) continue;
+              if (![1, 2, 3, 4].includes(ease)) continue;
+              const ankiReviewId = `${cid}:${revAt}`;
+              if (seenAnkiReviews.has(ankiReviewId)) continue;
+              freshReviews.push({ revAt, ease, ankiReviewId, cueId: entry.cueId });
+            }
+          }
+        }
+
+        freshReviews.sort((a, b) => a.revAt - b.revAt);
+        if (freshReviews.length) {
+          for (const rev of freshReviews) {
+            const c = p.cues.find(x => x.id === rev.cueId);
+            const before = p.schedule;
+            const introduced = p.firstReviewedAt == null;
+            p.schedule = scheduler.rate(before, rev.ease, rev.revAt, state.settings);
+            p.learningCueId = [1, 3].includes(p.schedule.state) ? rev.cueId : null;
+            p.firstReviewedAt ??= rev.revAt;
+            if (c) { c.latestRating = rev.ease; c.lastReviewedAt = rev.revAt; }
+            p.version++;
+            seenAnkiReviews.add(rev.ankiReviewId);
+            state.reviews.push({
+              id: randomUUID(),
+              requestId: `anki:${rev.ankiReviewId}`,
+              ankiReviewId: rev.ankiReviewId,
+              source: 'anki',
+              ticketId: null,
+              propositionId: p.id,
+              cueId: rev.cueId,
+              rating: rev.ease,
+              at: rev.revAt,
+              before,
+              after: p.schedule,
+              introduced,
+              deckIds: introduced ? memberships(state, p.id) : [],
+              settings: structuredClone(state.settings),
+            });
+            reviewsApplied++;
+          }
+          schedulesUpdated++;
+        } else if (fallbackCard && Number(fallbackCard.reps ?? 0) > (p.schedule.reps ?? 0)) {
+          p.schedule = ankiFormat.ankiScheduleToFsrs(fallbackCard, now, state.settings.dayStart);
+          p.firstReviewedAt ??= p.schedule.last_review ?? now;
+          p.version++;
+          schedulesUpdated++;
+        }
+      }
+      state.anki = { ...(state.anki || {}), lastSyncedAt: now };
+    });
+
+    return {
+      state: view(),
+      summary: { cardsChecked: syncedCues.length, reviewsApplied, schedulesUpdated, syncedAt: now },
+    };
+  });
+
   const cleanup = () => { disposed = true; for (const stop of observers.values()) stop(); observers.clear(); preflights.clear(); tickets.clear(); };
   ctx.cleanup(cleanup);
 }

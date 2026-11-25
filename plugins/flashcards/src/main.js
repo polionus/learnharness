@@ -2,6 +2,7 @@ import { mountLibraryTree } from './library-tree.js';
 import { createReviewController } from './review.js';
 import { mountDashboard } from './dashboard.js';
 import { buildPracticeCards } from './practice-queue.js';
+import { openExportDialog, openImportDialog, openSyncDialog } from './anki-ui.js';
 
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -265,11 +266,13 @@ export function activate(ctx) {
     const deleteSlot = el('span', 'fc-delete-selected');
     const deleteAction = button(deleteSlot, 'Delete selected', () => deleteContents({ cueIds: [...selection.cueIds], propositionIds: [...selection.emptyPropositionIds], deckIds: [...selection.emptyDeckIds] }, signal), signal, { icon: trashIcon, iconOnly: true, size: 'icon-sm', variant: 'ghost', title: 'Delete selected' });
     const clearSelection = button(selectionSummary, 'Clear', () => tree.clearSelection(), signal, { variant: 'ghost', disabled: true });
+    let exportAnkiButton;
     const updateSelection = () => {
       const selected = selection.count > 0;
       selectionCount.textContent = `${selection.count} selected`;
       reviewAction.update({ label: selected ? 'Review selected' : 'Review all', disabled: selected && !selection.cueIds.length });
       practiceAction.update({ label: selected ? 'Practice selected' : 'Practice all', disabled: selected ? !selection.cueIds.length : !hasPracticeCards });
+      exportAnkiButton?.update({ disabled: selected ? !selection.cueIds.length : !hasPracticeCards });
       const blocked = !!activeBatch(snapshot?.batch);
       deleteAction.update({ disabled: !selected || blocked, title: blocked ? deletionBlocked : 'Delete selected' });
       if (selected) scopeActions.append(deleteSlot); else deleteSlot.remove();
@@ -279,15 +282,50 @@ export function activate(ctx) {
     deckToolbar.append(searchLabel);
     button(deckToolbar, 'Create deck', () => editDeck(null, signal), signal);
     deckPanel.append(deckToolbar, selectionActions, treeSlot);
+    const ankiPanel = el('section', 'fc-anki-panel'), ankiInfo = el('div', 'fc-anki-info'), ankiTitle = el('span', 'fc-anki-title', 'Anki'), ankiMeta = el('span', 'fc-muted'), ankiActions = el('div', 'fc-actions');
+    ankiPanel.setAttribute('aria-label', 'Anki integration');
+    ankiMeta.setAttribute('role', 'status');
+    ankiInfo.append(ankiTitle, ankiMeta);
+    ankiPanel.append(ankiInfo, ankiActions);
+    let ankiNotice = '';
+    const updateAnkiPanel = state => {
+      const info = state?.anki;
+      const synced = info?.syncedCueCount ?? 0, total = info?.totalCueCount ?? 0;
+      const parts = [];
+      if (ankiNotice) parts.push(ankiNotice);
+      else if (info?.autoPushError) parts.push(`Auto-push failed: ${info.autoPushError}`);
+      else parts.push(total ? `${synced}/${total} linked with AnkiConnect` : 'Export .apkg packages or sync live via AnkiConnect');
+      if (info?.lastSyncedAt && !ankiNotice) parts.push(`Last synced ${new Date(info.lastSyncedAt).toLocaleString()}`);
+      ankiMeta.textContent = parts.join(' · ');
+    };
+    const ankiScope = () => selection.count ? { scope: { cueIds: [...selection.cueIds], propositionIds: [...selection.propositionIds] }, label: `selected cards (${selection.cueIds.length})` } : { scope: {}, label: 'all decks' };
+    const openAnkiExport = (scope, scopeLabel) => openExportDialog({
+      ctx, dialog, button, field, el, scope, scopeLabel, settings: snapshot?.settings ?? {}, signal,
+      onExported: note => { ankiNotice = note; updateAnkiPanel(snapshot); },
+    });
+    const openAnkiSync = (scope, scopeLabel) => openSyncDialog({
+      ctx, dialog, button, el, scope, scopeLabel, settings: snapshot?.settings ?? {}, signal,
+      onSynced: (nextState, note, deckId) => { ankiNotice = note; publish(nextState); updateAnkiPanel(nextState); if (deckId) revealDeck(deckId); },
+      onOpenExport: () => openAnkiExport(scope, scopeLabel),
+    });
+    const syncAnkiButton = button(ankiActions, 'Sync with Anki…', () => { const { scope, label } = ankiScope(); openAnkiSync(scope, label); }, signal);
+    exportAnkiButton = button(ankiActions, 'Export .apkg…', () => { const { scope, label } = ankiScope(); openAnkiExport(scope, label); }, signal, { disabled: true });
+    button(ankiActions, 'Import from Anki…', () => openImportDialog({
+      ctx, dialog, button, field, el, settings: snapshot?.settings ?? {}, signal,
+      onImported: (nextState, note, deckId) => { ankiNotice = note; publish(nextState); updateAnkiPanel(nextState); if (deckId) revealDeck(deckId); },
+    }), signal);
     const dashboardSlot = el('div', 'fc-dashboard-slot');
-    root.append(toolbar, fileStatus, error, batchArea, deckPanel, dashboardSlot); container.append(root);
+    root.append(toolbar, fileStatus, error, batchArea, deckPanel, ankiPanel, dashboardSlot); container.append(root);
     const dashboard = mountDashboard({ container: dashboardSlot, signal });
     tree = mountLibraryTree({ ctx, container: treeSlot, signal, button,
       onReview: scope => review.open(scope), onPreview: (p, cue, archive) => previewCue(p, cue, archive, signal),
       onEdit: (p, cue) => editCue(p, cue, signal), onDelete: (p, cue) => deleteCue(p, cue, signal),
       onCreateCard: deck => createCard(deck, null, signal, created => revealCreatedCard(created, deck.id)),
       onCreateCue: (p, deck) => createCard(deck, p, signal, created => revealCreatedCard(created, deck.id)),
-      onDeckSettings: deck => editDeck(deck, signal), onMemberships: p => memberships(p, snapshot, signal),
+      onDeckSettings: deck => editDeck(deck, signal),
+      onExportDeck: deck => openAnkiExport({ deckIds: [deck.id] }, `deck "${deck.name}"`),
+      onSyncDeck: deck => openAnkiSync({ deckIds: [deck.id] }, `deck "${deck.name}"`),
+      onMemberships: p => memberships(p, snapshot, signal),
       onReorder: input => mutate('reorder', input, signal), onRename: (id, name) => mutate('save-deck', { id, name }, signal),
       onSelection: value => { selection = value; updateSelection(); }, onError: showError,
     });
@@ -349,6 +387,9 @@ export function activate(ctx) {
       else if (cleanupMessage && error.textContent === cleanupMessage) { error.textContent = ''; cleanupMessage = null; }
       updateGenerationButtons(); renderBatch(state.batch); tree.update(state, search.value);
       hasPracticeCards = state.propositions.some(p => !p.archived && p.cues.some(c => !c.deleted)); updateSelection();
+      exportAnkiButton.update({ disabled: selection.count ? !selection.cueIds.length : !hasPracticeCards });
+      syncAnkiButton.update({ disabled: false });
+      updateAnkiPanel(state);
       dashboard.update(state.statistics);
     }, signal);
     return () => { view.abort(); review.dispose(); tree.dispose(); dashboard.dispose(); root.remove(); };
@@ -356,14 +397,14 @@ export function activate(ctx) {
 
   function mountSettings(container, hostSignal) {
     const scope = lifetime(hostSignal, ctx.signal), signal = scope.signal;
-    const root = el('div', 'fc-root fc-settings'), error = el('p', 'fc-error'), fields = el('div'), modelArea = el('div', 'fc-model-settings');
-    error.setAttribute('role', 'alert'); root.append(fields, modelArea, error); container.append(root);
-    let initialized = false, rows, followRows, modelPicker, thinkingPicker, modelPickers, modelRow, thinkingRow, catalog = null;
+    const root = el('div', 'fc-root fc-settings'), error = el('p', 'fc-error'), fields = el('div'), modelArea = el('div', 'fc-model-settings'), ankiArea = el('section', 'fc-anki-settings');
+    error.setAttribute('role', 'alert'); root.append(fields, modelArea, ankiArea, error); container.append(root);
+    let initialized = false, rows, followRows, ankiRows, modelPicker, thinkingPicker, modelPickers, modelRow, thinkingRow, catalog = null;
     let overrideDraft = false, modelBusy = false;
     const followingCheap = settings => !overrideDraft && !settings.modelOverride && settings.thinkingOverride == null;
     const showError = cause => { if (!signal.aborted) error.textContent = message(cause); };
     const save = async patch => {
-      try { const state = await ctx.call('save-settings', patch); if (signal.aborted) return; error.textContent = ''; publish(state); rows?.update({ rows: settingsRows(snapshot.settings) }); updateModels(snapshot.settings); }
+      try { const state = await ctx.call('save-settings', patch); if (signal.aborted) return; error.textContent = ''; publish(state); rows?.update({ rows: settingsRows(snapshot.settings) }); ankiRows?.update({ rows: ankiSettingsRows(snapshot.settings) }); updateModels(snapshot.settings); }
       catch (cause) { showError(cause); throw cause; }
     };
     const settingsRows = settings => {
@@ -374,6 +415,16 @@ export function activate(ctx) {
         row('relearningSteps', 'Relearning steps (minutes)', settings.relearningSteps.map(value => `${value}m`).join(' '), 'text', parseSteps),
         row('dayStart', 'Day starts at (hour)', settings.dayStart, 'number', Number, { min: 0, max: 23, step: 1 }),
         row('chunkBudget', 'Generation chunk budget (estimated tokens)', settings.chunkBudget, 'number', Number, { min: 1, step: 1 }),
+      ];
+    };
+    const ankiSettingsRows = settings => {
+      const row = (key, label, value, type, extras = {}) => ({ key, label, value, type, ...extras, onChange: async value => { try { await save({ [key]: value }); } catch (cause) { showError(cause); throw cause; } } });
+      return [
+        row('ankiUrl', 'AnkiConnect URL', settings.ankiUrl ?? 'http://127.0.0.1:8765', 'text', { description: 'Local AnkiConnect endpoint (add-on 2055492159)' }),
+        row('ankiApiKey', 'AnkiConnect API key', settings.ankiApiKey ?? '', 'text', { description: 'Optional secret configured in AnkiConnect' }),
+        row('ankiDeckPrefix', 'Anki deck prefix', settings.ankiDeckPrefix ?? 'LearnHarness', 'text', { description: 'Parent deck prefix (leave blank for top-level decks)' }),
+        row('ankiIncludeScheduling', 'Include FSRS-6 scheduling', settings.ankiIncludeScheduling ?? true, 'toggle', { description: 'Preserve review progress in .apkg exports and imports' }),
+        row('ankiAutoPush', 'Auto-push new cards to Anki', settings.ankiAutoPush ?? false, 'toggle', { description: 'Automatically sync generated, created, or edited cards to AnkiConnect' }),
       ];
     };
     const changeModels = async patch => {
@@ -413,8 +464,23 @@ export function activate(ctx) {
         modelPicker = widget(ctx.ui.mountModelPicker(modelSlot, { value: state.settings.modelOverride || undefined, onChange: async value => { try { await changeModels({ modelOverride: value, thinkingOverride: null }); } catch { /* Keep error visible. */ } } }, { signal }), signal);
         thinkingPicker = widget(ctx.ui.mountThinkingPicker(thinkingSlot, { model: state.settings.modelOverride || undefined, value: state.settings.thinkingOverride ?? undefined, onChange: async value => { try { await changeModels({ thinkingOverride: value }); } catch { /* Keep error visible. */ } } }, { signal }), signal);
         updateModels(state.settings);
+        const ankiRowsSlot = el('div'), ankiTestRow = el('div', 'fc-actions fc-anki-test-row'), ankiTestStatus = el('span', 'fc-muted');
+        ankiTestStatus.setAttribute('role', 'status');
+        ankiArea.append(el('h3', 'fc-settings-heading', 'Anki integration'), ankiRowsSlot, ankiTestRow);
+        ankiRows = widget(ctx.ui.mountSettingsRows(ankiRowsSlot, { rows: ankiSettingsRows(state.settings) }, { signal }), signal);
+        button(ankiTestRow, 'Test AnkiConnect', async () => {
+          ankiTestStatus.textContent = 'Checking…';
+          try {
+            const status = await ctx.call('anki-status', {});
+            if (signal.aborted) return;
+            ankiTestStatus.textContent = status.connected
+              ? `Connected to AnkiConnect v${status.version} (${status.decks.length} decks)`
+              : status.error || 'AnkiConnect not reachable.';
+          } catch (cause) { if (!signal.aborted) ankiTestStatus.textContent = message(cause); }
+        }, signal);
+        ankiTestRow.append(ankiTestStatus);
         void ctx.call('get-catalog').then(value => { if (!signal.aborted) { catalog = value; updateModels(snapshot.settings); } }).catch(showError);
-      } else { rows.update({ rows: settingsRows(state.settings) }); updateModels(state.settings); }
+      } else { rows.update({ rows: settingsRows(state.settings) }); ankiRows?.update({ rows: ankiSettingsRows(state.settings) }); updateModels(state.settings); }
     }, signal);
     return () => { scope.abort(); root.remove(); };
   }

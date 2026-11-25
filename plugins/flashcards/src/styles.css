@@ -99,4 +99,18 @@
 .fc-root .fc-model-settings { display: grid; gap: 16px; margin-top: 18px; }
 .fc-root .fc-model-overrides { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 10px; }
 .fc-root .fc-model-row, .fc-root .fc-thinking-row { display: inline-flex; }
+.fc-root .fc-anki-panel { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--border, #8885); border-radius: 10px; }
+.fc-root .fc-anki-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.fc-root .fc-anki-title { font-weight: 600; font-size: 13px; }
+.fc-root .fc-anki-settings { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border, #8884); }
+.fc-root .fc-settings-heading { font-size: 13px; font-weight: 600; margin: 0 0 12px; }
+.fc-root .fc-anki-test-row { margin-top: 12px; }
+.fc-root .fc-anki-sync-body { display: grid; gap: 14px; margin: 12px 0; }
+.fc-root .fc-anki-section { padding-top: 12px; border-top: 1px solid var(--border, #8884); display: grid; gap: 6px; }
+.fc-root .fc-anki-section:first-child { padding-top: 0; border-top: 0; }
+.fc-root .fc-anki-subheading { font-size: 13px; font-weight: 600; margin: 0; }
+.fc-root .fc-anki-deck-list { max-height: 160px; overflow-y: auto; border: 1px solid var(--border, #8884); border-radius: 6px; padding: 6px 10px; }
+.fc-root .fc-anki-guide { margin: 4px 0 8px; padding-left: 20px; font-size: 13px; display: grid; gap: 4px; }
+.fc-root .fc-anki-result { font-size: 12px; margin: 8px 0 0; }
+.fc-root .fc-anki-result:empty { display: none; }
 @media (max-width: 600px) { .fc-library { padding: 10px; } .fc-root.fc-review-surface { padding: 40px 12px 24px; } .fc-root .fc-review-card { padding: 20px; } }

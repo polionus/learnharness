@@ -48,7 +48,10 @@ function migrate(state) {
   for (const r of state.reviews) for (const key of ['question', 'answer']) if (Object.hasOwn(r, key)) { delete r[key]; changed = true; }
   return changed;
 }
-const defaults = () => ({ retention: 0.9, learningSteps: [1, 10], relearningSteps: [10], dayStart: 4, fuzz: false, chunkBudget: 4000, modelOverride: null });
+const defaults = () => ({
+  retention: 0.9, learningSteps: [1, 10], relearningSteps: [10], dayStart: 4, fuzz: false, chunkBudget: 4000, modelOverride: null,
+  ankiUrl: 'http://127.0.0.1:8765', ankiApiKey: '', ankiDeckPrefix: 'LearnHarness', ankiIncludeScheduling: true, ankiAutoPush: false,
+});
 function openStore(directory) {
   fs.mkdirSync(directory, { recursive: true });
   const file = path.join(directory, 'flashcards.json');
