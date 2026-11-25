@@ -3,6 +3,15 @@ import { createReviewController } from './review.js';
 import { mountDashboard } from './dashboard.js';
 import { buildPracticeCards } from './practice-queue.js';
 import { openExportDialog, openImportDialog, openSyncDialog } from './anki-ui.js';
+import {
+  CARD_TYPES,
+  inferCardType,
+  cardTypeInfo,
+  renderClozeQuestion,
+  renderClozeAnswer,
+  mountCardTypeSelector,
+  openPromptEditorDialog,
+} from './card-type-ui.js';
 
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -134,15 +143,39 @@ export function activate(ctx) {
       answer: field(root, 'Answer (Markdown)', cue.answer, 'textarea'),
     };
   }
+  function insertClozeTemplate(textarea) {
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? textarea.value.length;
+    const existing = textarea.value;
+    const selected = existing.slice(start, end) || 'answer';
+    const nextNum = Math.max(0, ...[...existing.matchAll(/\{\{c(\d+)::/g)].map(m => Number(m[1]))) + 1;
+    const snippet = `{{c${nextNum}::${selected}}}`;
+    textarea.value = existing.slice(0, start) + snippet + existing.slice(end);
+    textarea.focus?.();
+    if (typeof textarea.setSelectionRange === 'function') {
+      const caret = start + snippet.length;
+      textarea.setSelectionRange(caret, caret);
+    }
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  }
   function createCard(deck, proposition, signal, onCreated) {
     const requestId = uuid();
     dialog(proposition ? 'Add cue' : 'Create card', signal, ({ root, actions, signal: ds, run, close }) => {
       const name = proposition ? null : field(root, 'Name', '');
       const { question, answer } = cueFields(root);
+      const typePicker = mountCardTypeSelector(root, {
+        value: 'basic',
+        addReverse: false,
+        onInsertCloze: () => insertClozeTemplate(question),
+        signal: ds,
+      });
       button(actions, 'Save', run(async () => {
+        const cardType = typePicker.value;
         const created = await ctx.call(proposition ? 'create-cue' : 'create-card', {
           ...(proposition ? { propositionId: proposition.id } : { deckId: deck.id, name: name.value }),
           question: question.value, answer: answer.value, requestId,
+          ...(cardType !== 'basic' ? { cardType } : {}),
+          ...(cardType === 'basic-optional-reversed' && typePicker.addReverse ? { addReverse: true } : {}),
         });
         if (ds.aborted) return;
         publish(created.state); close(); onCreated(created);
@@ -152,7 +185,21 @@ export function activate(ctx) {
   function editCue(proposition, cue, signal) {
     dialog('Edit cue', signal, ({ root, actions, signal: ds, run, close }) => {
       const { question, answer } = cueFields(root, cue);
-      button(actions, 'Save', run(async () => { if (await mutate('save-cue', { propositionId: proposition.id, cueId: cue.id, question: question.value, answer: answer.value, version: proposition.version }, ds)) close(); }), ds, { variant: 'default' });
+      const typePicker = mountCardTypeSelector(root, {
+        value: inferCardType(cue),
+        addReverse: Boolean(cue.addReverse),
+        onInsertCloze: () => insertClozeTemplate(question),
+        signal: ds,
+      });
+      button(actions, 'Save', run(async () => {
+        const cardType = typePicker.value;
+        const payload = {
+          propositionId: proposition.id, cueId: cue.id, question: question.value, answer: answer.value, version: proposition.version,
+          ...(cardType !== inferCardType(cue) || cardType !== 'basic' ? { cardType } : {}),
+          ...(cardType === 'basic-optional-reversed' ? { addReverse: typePicker.addReverse } : {}),
+        };
+        if (await mutate('save-cue', payload, ds)) close();
+      }), ds, { variant: 'default' });
     });
   }
   function deleteContents(scope, signal) {
@@ -188,7 +235,11 @@ export function activate(ctx) {
     dialog(proposition.name, signal, ({ root, actions, signal: ds, close }) => {
       root.classList.add('fc-preview-dialog');
       const card = el('div', 'fc-review-card fc-preview-card'), answer = el('div', 'fc-answer');
-      markdown(card, cue.question, ds); markdown(answer, cue.answer, ds);
+      const cardType = inferCardType(cue);
+      if (cardType !== 'basic') card.append(el('span', 'fc-card-type-badge', cardTypeInfo(cardType).label));
+      const qText = cardType === 'cloze' ? renderClozeQuestion(cue.question) : cue.question;
+      const aText = cardType === 'cloze' ? renderClozeAnswer(cue.question, cue.answer) : cue.answer;
+      markdown(card, qText, ds); markdown(answer, aText, ds);
       card.append(answer); root.append(card);
       if (!archive) {
         button(actions, 'Edit', () => { close(); editCue(proposition, cue, signal); }, ds);
@@ -288,6 +339,85 @@ export function activate(ctx) {
     deckToolbar.append(searchLabel);
     button(deckToolbar, 'Create deck', () => editDeck(null, signal), signal);
     deckPanel.append(deckToolbar, selectionActions, treeSlot);
+
+    // Quick study summary strip (due, new, total cards, Anki linked + one-click Review due).
+    const summaryStrip = el('section', 'fc-summary-strip');
+    summaryStrip.setAttribute('aria-label', 'Study summary');
+    const statItem = (label, shade) => {
+      const box = el('div', 'fc-summary-stat');
+      if (shade) box.dataset.shade = shade;
+      const val = el('span', 'fc-summary-value', '0');
+      const lbl = el('span', 'fc-summary-label', label);
+      box.append(val, lbl);
+      return { box, val };
+    };
+    const dueStat = statItem('Due now', 'due');
+    const newStat = statItem('New', 'new');
+    const totalStat = statItem('Total cues');
+    const linkedStat = statItem('Anki linked', 'anki');
+    const summaryMetrics = el('div', 'fc-summary-metrics');
+    summaryMetrics.append(dueStat.box, newStat.box, totalStat.box, linkedStat.box);
+    const summaryActions = el('div', 'fc-actions');
+    const quickReviewButton = button(summaryActions, 'Review due', () => review.open({}), signal, { variant: 'default', disabled: true });
+    summaryStrip.append(summaryMetrics, summaryActions);
+
+    // Workspace tools grid: Generation Prompt & Card Types + Anki integration.
+    const toolsGrid = el('div', 'fc-tools-grid');
+
+    const promptPanel = el('section', 'fc-prompt-panel');
+    promptPanel.setAttribute('aria-label', 'Generation prompt and card types');
+    const promptHeader = el('div', 'fc-tool-header');
+    const promptInfo = el('div', 'fc-anki-info');
+    const promptTitle = el('span', 'fc-anki-title', 'Card generation prompt & types');
+    const promptMeta = el('span', 'fc-muted', 'Default system prompt');
+    promptInfo.append(promptTitle, promptMeta);
+    const promptActions = el('div', 'fc-actions');
+    button(promptActions, 'Edit system prompt…', () => openPromptEditorDialog({
+      ctx, dialog, button, el, state: snapshot, signal,
+      onSaved: nextState => { publish(nextState); },
+    }), signal);
+    promptHeader.append(promptInfo, promptActions);
+    const cardTypePillsRow = el('div', 'fc-card-type-group');
+    cardTypePillsRow.setAttribute('role', 'group');
+    cardTypePillsRow.setAttribute('aria-label', 'Enabled Anki card types for generation');
+    let savingCardTypes = false;
+    const typeToggleButtons = CARD_TYPES.map(t => {
+      const pill = el('button', 'fc-pill-btn', t.shortLabel);
+      pill.type = 'button';
+      pill.dataset.cardType = t.id;
+      pill.title = `${t.label}: ${t.description}`;
+      pill.setAttribute('aria-pressed', 'false');
+      pill.addEventListener('click', async () => {
+        if (savingCardTypes || signal.aborted || !snapshot) return;
+        const current = new Set(Array.isArray(snapshot.settings?.generationCardTypes) && snapshot.settings.generationCardTypes.length ? snapshot.settings.generationCardTypes : ['basic']);
+        if (current.has(t.id)) {
+          if (current.size <= 1) { showError('Keep at least one Anki card type enabled.'); return; }
+          current.delete(t.id);
+        } else {
+          current.add(t.id);
+        }
+        savingCardTypes = true;
+        try {
+          error.textContent = '';
+          await mutate('save-settings', { generationCardTypes: [...current] }, signal);
+        } catch (cause) { showError(message(cause)); }
+        finally { savingCardTypes = false; }
+      }, { signal });
+      cardTypePillsRow.append(pill);
+      return { id: t.id, pill };
+    });
+    promptPanel.append(promptHeader, cardTypePillsRow);
+    const updatePromptPanel = state => {
+      const enabled = new Set(Array.isArray(state?.settings?.generationCardTypes) && state.settings.generationCardTypes.length ? state.settings.generationCardTypes : ['basic']);
+      for (const item of typeToggleButtons) {
+        const active = enabled.has(item.id);
+        item.pill.setAttribute('aria-pressed', String(active));
+        item.pill.dataset.active = String(active);
+      }
+      const isCustom = Boolean(state?.settings?.generationPrompt && state.settings.generationPrompt.trim());
+      promptMeta.textContent = `${isCustom ? 'Custom system prompt' : 'Default system prompt'} · ${enabled.size} ${enabled.size === 1 ? 'card type' : 'card types'} active`;
+    };
+
     const ankiPanel = el('section', 'fc-anki-panel'), ankiInfo = el('div', 'fc-anki-info'), ankiTitle = el('span', 'fc-anki-title', 'Anki'), ankiMeta = el('span', 'fc-muted'), ankiActions = el('div', 'fc-actions');
     ankiPanel.setAttribute('aria-label', 'Anki integration');
     ankiMeta.setAttribute('role', 'status');
@@ -303,6 +433,22 @@ export function activate(ctx) {
       else parts.push(total ? `${synced}/${total} linked with AnkiConnect` : 'Export .apkg packages or sync live via AnkiConnect');
       if (info?.lastSyncedAt && !ankiNotice) parts.push(`Last synced ${new Date(info.lastSyncedAt).toLocaleString()}`);
       ankiMeta.textContent = parts.join(' · ');
+    };
+    const updateSummaryStrip = state => {
+      const liveProps = (state?.propositions ?? []).filter(p => !p.archived);
+      const dueTotal = (state?.statistics?.due ?? []).slice(0, 2).reduce((sum, row) => sum + (row.count || 0), 0);
+      const newCount = state?.statistics?.states?.new ?? 0;
+      const totalCues = liveProps.reduce((sum, p) => sum + p.cues.filter(c => !c.deleted).length, 0);
+      const synced = state?.anki?.syncedCueCount ?? 0;
+      dueStat.val.textContent = String(dueTotal);
+      newStat.val.textContent = String(newCount);
+      totalStat.val.textContent = String(totalCues);
+      linkedStat.val.textContent = String(synced);
+      const canStudy = dueTotal > 0 || newCount > 0;
+      quickReviewButton.update({
+        label: dueTotal > 0 ? `Review due (${dueTotal})` : newCount > 0 ? 'Study new cards' : 'All caught up',
+        disabled: !canStudy,
+      });
     };
     const ankiScope = () => selection.count ? { scope: { cueIds: [...selection.cueIds], propositionIds: [...selection.propositionIds] }, label: `selected cards (${selection.cueIds.length})` } : { scope: {}, label: 'all decks' };
     const openAnkiExport = (scope, scopeLabel) => openExportDialog({
@@ -320,8 +466,9 @@ export function activate(ctx) {
       ctx, dialog, button, field, el, settings: snapshot?.settings ?? {}, signal,
       onImported: (nextState, note, deckId) => { ankiNotice = note; publish(nextState); updateAnkiPanel(nextState); if (deckId) revealDeck(deckId); },
     }), signal);
+    toolsGrid.append(promptPanel, ankiPanel);
     const dashboardSlot = el('div', 'fc-dashboard-slot');
-    root.append(toolbar, fileStatusWrap, error, batchArea, deckPanel, ankiPanel, dashboardSlot); container.append(root);
+    root.append(toolbar, fileStatusWrap, error, batchArea, summaryStrip, deckPanel, toolsGrid, dashboardSlot); container.append(root);
     const dashboard = mountDashboard({ container: dashboardSlot, signal });
     tree = mountLibraryTree({ ctx, container: treeSlot, signal, button,
       onReview: scope => review.open(scope), onPreview: (p, cue, archive) => previewCue(p, cue, archive, signal),
@@ -495,6 +642,8 @@ export function activate(ctx) {
       hasPracticeCards = state.propositions.some(p => !p.archived && p.cues.some(c => !c.deleted)); updateSelection();
       exportAnkiButton.update({ disabled: selection.count ? !selection.cueIds.length : !hasPracticeCards });
       syncAnkiButton.update({ disabled: false });
+      updateSummaryStrip(state);
+      updatePromptPanel(state);
       updateAnkiPanel(state);
       dashboard.update(state.statistics);
     }, signal);
@@ -503,9 +652,10 @@ export function activate(ctx) {
 
   function mountSettings(container, hostSignal) {
     const scope = lifetime(hostSignal, ctx.signal), signal = scope.signal;
-    const root = el('div', 'fc-root fc-settings'), error = el('p', 'fc-error'), fields = el('div'), modelArea = el('div', 'fc-model-settings'), ankiArea = el('section', 'fc-anki-settings');
-    error.setAttribute('role', 'alert'); root.append(fields, modelArea, ankiArea, error); container.append(root);
+    const root = el('div', 'fc-root fc-settings'), error = el('p', 'fc-error'), fields = el('div'), modelArea = el('div', 'fc-model-settings'), promptArea = el('section', 'fc-prompt-settings'), ankiArea = el('section', 'fc-anki-settings');
+    error.setAttribute('role', 'alert'); root.append(fields, modelArea, promptArea, ankiArea, error); container.append(root);
     let initialized = false, rows, followRows, ankiRows, modelPicker, thinkingPicker, modelPickers, modelRow, thinkingRow, catalog = null;
+    let promptInput, promptStatus, promptTypeBoxes = [], promptDirty = false;
     let overrideDraft = false, modelBusy = false;
     const followingCheap = settings => !overrideDraft && !settings.modelOverride && settings.thinkingOverride == null;
     const showError = cause => { if (!signal.aborted) error.textContent = message(cause); };
@@ -570,6 +720,61 @@ export function activate(ctx) {
         modelPicker = widget(ctx.ui.mountModelPicker(modelSlot, { value: state.settings.modelOverride || undefined, onChange: async value => { try { await changeModels({ modelOverride: value, thinkingOverride: null }); } catch { /* Keep error visible. */ } } }, { signal }), signal);
         thinkingPicker = widget(ctx.ui.mountThinkingPicker(thinkingSlot, { model: state.settings.modelOverride || undefined, value: state.settings.thinkingOverride ?? undefined, onChange: async value => { try { await changeModels({ thinkingOverride: value }); } catch { /* Keep error visible. */ } } }, { signal }), signal);
         updateModels(state.settings);
+
+        // Generation system prompt & Anki card types section in Settings.
+        const defaultPromptText = state.generationDefaults?.prompt || '';
+        const presets = state.generationDefaults?.presets || [];
+        promptArea.append(el('h3', 'fc-settings-heading', 'Generation system prompt & card types'));
+        promptArea.append(el('p', 'fc-muted', 'Customize the card-writing system prompt and choose which basic Anki card types Flashcards generates.'));
+        const typesWrap = el('div', 'fc-prompt-types');
+        const currentTypes = new Set(Array.isArray(state.settings.generationCardTypes) && state.settings.generationCardTypes.length ? state.settings.generationCardTypes : ['basic']);
+        promptTypeBoxes = CARD_TYPES.map(t => {
+          const label = el('label', 'fc-check fc-prompt-type-item');
+          const box = el('input');
+          box.type = 'checkbox';
+          box.checked = currentTypes.has(t.id);
+          box.addEventListener('change', () => { promptDirty = true; }, { signal });
+          const copy = el('span', 'fc-prompt-type-copy');
+          copy.append(el('strong', '', t.label), el('span', 'fc-muted', ` — ${t.description}`));
+          label.append(box, copy);
+          typesWrap.append(label);
+          return { id: t.id, box };
+        });
+        const presetBar = el('div', 'fc-actions fc-prompt-presets');
+        promptInput = el('textarea', 'fc-input fc-prompt-textarea');
+        promptInput.setAttribute('aria-label', 'Generation system prompt');
+        promptInput.value = (state.settings.generationPrompt && state.settings.generationPrompt.trim()) ? state.settings.generationPrompt : defaultPromptText;
+        promptInput.addEventListener('input', () => { promptDirty = true; }, { signal });
+        for (const preset of presets) {
+          const pill = el('button', 'fc-pill-btn', preset.label);
+          pill.type = 'button';
+          pill.title = preset.description;
+          pill.addEventListener('click', () => {
+            promptInput.value = preset.prompt ?? defaultPromptText;
+            const set = new Set(preset.cardTypes || ['basic']);
+            for (const item of promptTypeBoxes) item.box.checked = set.has(item.id);
+            promptDirty = true;
+          }, { signal });
+          presetBar.append(pill);
+        }
+        const promptBtnRow = el('div', 'fc-actions fc-anki-test-row');
+        promptStatus = el('span', 'fc-muted');
+        promptStatus.setAttribute('role', 'status');
+        button(promptBtnRow, 'Save prompt', async () => {
+          const selected = promptTypeBoxes.filter(item => item.box.checked).map(item => item.id);
+          if (!selected.length) { showError('Select at least one Anki card type.'); return; }
+          await save({ generationPrompt: promptInput.value, generationCardTypes: selected });
+          if (!signal.aborted) { promptDirty = false; promptStatus.textContent = 'Saved.'; }
+        }, signal, { variant: 'default' });
+        button(promptBtnRow, 'Reset to default', async () => {
+          promptInput.value = defaultPromptText;
+          for (const item of promptTypeBoxes) item.box.checked = item.id === 'basic';
+          await save({ generationPrompt: '', generationCardTypes: ['basic'] });
+          if (!signal.aborted) { promptDirty = false; promptStatus.textContent = 'Reset to default prompt.'; }
+        }, signal);
+        promptBtnRow.append(promptStatus);
+        promptArea.append(typesWrap, presetBar, promptInput, promptBtnRow);
+
         const ankiRowsSlot = el('div'), ankiTestRow = el('div', 'fc-actions fc-anki-test-row'), ankiTestStatus = el('span', 'fc-muted');
         ankiTestStatus.setAttribute('role', 'status');
         ankiArea.append(el('h3', 'fc-settings-heading', 'Anki integration'), ankiRowsSlot, ankiTestRow);
@@ -586,7 +791,17 @@ export function activate(ctx) {
         }, signal);
         ankiTestRow.append(ankiTestStatus);
         void ctx.call('get-catalog').then(value => { if (!signal.aborted) { catalog = value; updateModels(snapshot.settings); } }).catch(showError);
-      } else { rows.update({ rows: settingsRows(state.settings) }); ankiRows?.update({ rows: ankiSettingsRows(state.settings) }); updateModels(state.settings); }
+      } else {
+        rows.update({ rows: settingsRows(state.settings) });
+        ankiRows?.update({ rows: ankiSettingsRows(state.settings) });
+        updateModels(state.settings);
+        if (!promptDirty && promptInput) {
+          const def = state.generationDefaults?.prompt || '';
+          promptInput.value = (state.settings.generationPrompt && state.settings.generationPrompt.trim()) ? state.settings.generationPrompt : def;
+          const set = new Set(Array.isArray(state.settings.generationCardTypes) && state.settings.generationCardTypes.length ? state.settings.generationCardTypes : ['basic']);
+          for (const item of promptTypeBoxes) item.box.checked = set.has(item.id);
+        }
+      }
     }, signal);
     return () => { scope.abort(); root.remove(); };
   }

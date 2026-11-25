@@ -1,4 +1,5 @@
 // Page-bound review, using only the public plugin UI and RPC contracts.
+import { inferCardType, cardTypeInfo, renderClozeQuestion, renderClozeAnswer, renderTypeAnswerComparison } from './card-type-ui.js';
 const ratings = ["Again", "Hard", "Good", "Easy"];
 const ratingOptions = label => {
   const color = `var(--fc-rating-${label.toLowerCase()})`;
@@ -99,12 +100,35 @@ export function createReviewController({ ctx, signal, button, markdown, onRated 
       }
       function question(ticket, cs, count) {
         card.hidden = false;
-        markdown(card, ticket.question, cs);
+        const cardType = inferCardType(ticket);
+        if (cardType !== "basic") {
+          card.append(el("span", "fc-card-type-badge", cardTypeInfo(cardType).label));
+        }
+        const promptText = cardType === "cloze" ? renderClozeQuestion(ticket.question) : ticket.question;
+        markdown(card, promptText, cs);
+        let typeInput = null;
+        if (cardType === "basic-type-answer") {
+          const wrap = el("div", "fc-type-answer-wrap");
+          typeInput = el("input", "fc-input fc-type-answer-input");
+          typeInput.type = "text";
+          typeInput.placeholder = "Type your answer and press Enter…";
+          typeInput.setAttribute("aria-label", "Type your answer");
+          typeInput.addEventListener("keydown", event => {
+            if (event.isComposing || event.keyCode === 229) return;
+            if (event.key === "Enter" && !revealed) {
+              event.preventDefault();
+              event.stopPropagation();
+              void revealAction?.();
+            }
+          }, { signal: cs });
+          wrap.append(typeInput);
+          card.append(wrap);
+        }
         const answer = el("div", "fc-answer"), actions = el("div", "fc-actions"), error = el("p", "fc-error");
         error.setAttribute("role", "alert");
         card.append(answer); footer.append(actions, error);
         if (count !== undefined) bottom.append(el("p", "fc-review-remaining", count));
-        return { answer, actions, error };
+        return { answer, actions, error, cardType, typeInput };
       }
       function control(parent, label, action, cs, hint, options = {}) {
         const wrapper = el("div", "fc-rating"); parent.append(wrapper);
@@ -119,13 +143,14 @@ export function createReviewController({ ctx, signal, button, markdown, onRated 
         const cs = reset(), index = practiceIndex, cue = practiceCards[index];
         if (!cue) { footer.append(el("p", "fc-review-meta", "Practice complete.")); return; }
         const remaining = practiceCards.length - index - 1;
-        const { answer, actions } = question(cue, cs, `${remaining} ${remaining === 1 ? 'card' : 'cards'} remaining`);
+        const { answer, actions, cardType, typeInput } = question(cue, cs, `${remaining} ${remaining === 1 ? 'card' : 'cards'} remaining`);
         let revealButton;
         revealAction = () => {
           if (revealed || cs.aborted || index !== practiceIndex) return;
           focusOwned(); revealed = true;
           title.textContent = cue.propositionName; title.hidden = false;
-          markdown(answer, cue.answer, cs);
+          if (typeInput) { typeInput.disabled = true; renderTypeAnswerComparison(answer, typeInput.value, cue.answer); }
+          else markdown(answer, cardType === "cloze" ? renderClozeAnswer(cue.question, cue.answer) : cue.answer, cs);
           revealButton.dispose(); actions.replaceChildren();
           advanceAction = () => {
             if (cs.aborted || !revealed || index !== practiceIndex) return;
@@ -157,7 +182,7 @@ export function createReviewController({ ctx, signal, button, markdown, onRated 
             return;
           }
           const ticket = result.ticket;
-          const { answer, actions, error } = question(ticket, cs, result.remaining === undefined ? undefined : `${result.remaining} ready`);
+          const { answer, actions, error, cardType, typeInput } = question(ticket, cs, result.remaining === undefined ? undefined : `${result.remaining} ready`);
           let revealButton, retryButton, revealBusy = false, ratingBusy = false;
           const requests = new Map();
           const failed = cause => {
@@ -174,7 +199,8 @@ export function createReviewController({ ctx, signal, button, markdown, onRated 
               if (cs.aborted) return;
               revealed = true; error.textContent = "";
               title.textContent = ticket.propositionName; title.hidden = false;
-              markdown(answer, result.answer, cs);
+              if (typeInput) { typeInput.disabled = true; renderTypeAnswerComparison(answer, typeInput.value, result.answer); }
+              else markdown(answer, cardType === "cloze" ? renderClozeAnswer(ticket.question, result.answer) : result.answer, cs);
               focusOwned();
               revealButton.dispose(); actions.replaceChildren();
               const ratingButtons = [];

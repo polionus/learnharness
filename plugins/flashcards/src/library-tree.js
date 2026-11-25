@@ -1,4 +1,5 @@
 // Plugin-owned data/actions inside the shared native tree. No host implementation imports.
+import { inferCardType, cardTypeInfo } from './card-type-ui.js';
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -128,7 +129,14 @@ export function mountLibraryTree({ ctx, container, signal, button, onReview, onP
         const title = record.kind === 'deck' ? record.deck.name : record.kind === 'proposition' ? record.p.name : record.kind === 'cue' ? record.cue.question.replace(/\s+/g, ' ').trim() || 'Cue' : 'Archive';
         label.textContent = title;
         label.title = record.kind === 'proposition' ? record.p.statement || title : record.kind === 'deck' ? 'Rename deck' : title;
-        metadata.textContent = record.kind === 'proposition' ? `${record.p.cues.filter(c => !c.deleted).length} cues` : '';
+        if (record.kind === 'proposition') {
+          metadata.textContent = `${record.p.cues.filter(c => !c.deleted).length} cues`;
+        } else if (record.kind === 'cue') {
+          const ct = inferCardType(record.cue);
+          metadata.textContent = ct !== 'basic' ? cardTypeInfo(ct).shortLabel : '';
+        } else {
+          metadata.textContent = '';
+        }
         if (draft) {
           label.hidden = draft.editing;
           if (draft.editing) { if (input.parentElement !== labelSlot) labelSlot.prepend(input); if (input.value !== draft.value) input.value = draft.value; }

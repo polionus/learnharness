@@ -2,9 +2,9 @@
 const {
   MODEL_NAME,
   MODEL_CSS,
-  FRONT_TEMPLATE,
-  BACK_TEMPLATE,
-  markdownToAnkiHtml,
+  ankiModelSpec,
+  buildAnkiFieldsForCue,
+  detectCardTypeFromAnkiModel,
   ankiHtmlToMarkdown,
   hasClozeSyntax,
   expandClozeCards,
@@ -93,23 +93,26 @@ async function checkStatus(config = {}, fetchImpl = globalThis.fetch) {
   }
 }
 
-async function ensureModel(config = {}, fetchImpl = globalThis.fetch) {
+async function ensureModel(config = {}, fetchImpl = globalThis.fetch, cardType = 'basic') {
+  const spec = ankiModelSpec(cardType);
   const models = await invokeAnki('modelNames', {}, config, fetchImpl);
-  if (Array.isArray(models) && models.includes(MODEL_NAME)) return MODEL_NAME;
+  if (Array.isArray(models) && models.includes(spec.ankiModel)) return spec.ankiModel;
   await invokeAnki('createModel', {
-    modelName: MODEL_NAME,
-    inOrderFields: ['Front', 'Back', 'Proposition'],
+    modelName: spec.ankiModel,
+    inOrderFields: spec.fields,
     css: MODEL_CSS,
-    cardTemplates: [{ Name: 'Card 1', Front: FRONT_TEMPLATE, Back: BACK_TEMPLATE }],
+    isCloze: spec.isCloze,
+    cardTemplates: spec.templates,
   }, config, fetchImpl);
-  return MODEL_NAME;
+  return spec.ankiModel;
 }
 
-function buildCueTags(proposition, cue) {
+function buildCueTags(proposition, cue, cardType = 'basic') {
   const origin = proposition.origin || 'graph';
   return [
     'learnharness',
     `lh-origin::${ankiTag(origin)}`,
+    `lh-type::${ankiTag(cardType)}`,
     `lh-prop:${ankiTag(proposition.id)}`,
     `lh-cue:${ankiTag(cue.id)}`,
   ];
@@ -120,7 +123,21 @@ async function pushToAnki({ items, config = {}, syncAnkiWeb = false, fetchImpl =
   for (const name of deckSet) {
     await invokeAnki('createDeck', { deck: name }, config, fetchImpl);
   }
-  await ensureModel(config, fetchImpl);
+  const existingModels = new Set(await invokeAnki('modelNames', {}, config, fetchImpl) || []);
+  const neededTypes = new Set(items.map(item => buildAnkiFieldsForCue(item.cue, item.proposition).cardType));
+  for (const cardType of neededTypes) {
+    const spec = ankiModelSpec(cardType);
+    if (!existingModels.has(spec.ankiModel)) {
+      await invokeAnki('createModel', {
+        modelName: spec.ankiModel,
+        inOrderFields: spec.fields,
+        css: MODEL_CSS,
+        isCloze: spec.isCloze,
+        cardTemplates: spec.templates,
+      }, config, fetchImpl);
+      existingModels.add(spec.ankiModel);
+    }
+  }
 
   const now = Date.now();
   const mappings = [];
@@ -142,11 +159,9 @@ async function pushToAnki({ items, config = {}, syncAnkiWeb = false, fetchImpl =
 
   for (const item of items) {
     const targetDeck = ankiDeckName(item.deckName, config.deckPrefix);
-    const frontHtml = markdownToAnkiHtml(item.cue.question);
-    const backHtml = markdownToAnkiHtml(item.cue.answer);
-    const propHtml = item.proposition.name ? markdownToAnkiHtml(item.proposition.name) : '';
-    const hash = cueFingerprint(item.cue.question, item.cue.answer, item.proposition.name, targetDeck);
-    const tags = buildCueTags(item.proposition, item.cue);
+    const { cardType, spec, fields } = buildAnkiFieldsForCue(item.cue, item.proposition);
+    const hash = cueFingerprint(item.cue.question, item.cue.answer, item.proposition.name, targetDeck, cardType, item.cue.addReverse);
+    const tags = buildCueTags(item.proposition, item.cue, cardType);
 
     let noteId = item.cue.anki?.noteId;
     if (!noteId || !existingById.has(noteId)) {
@@ -167,10 +182,13 @@ async function pushToAnki({ items, config = {}, syncAnkiWeb = false, fetchImpl =
       const contentChanged = !prev || prev.syncedHash !== hash || prev.noteId !== noteId;
       const deckChanged = prev?.deckName && prev.deckName !== targetDeck;
       if (contentChanged) {
-        const fields = info.fields && Object.hasOwn(info.fields, 'Proposition')
-          ? { Front: frontHtml, Back: backHtml, Proposition: propHtml }
-          : { Front: frontHtml, Back: backHtml };
-        await invokeAnki('updateNoteFields', { note: { id: noteId, fields } }, config, fetchImpl);
+        const updateFields = {};
+        for (const [k, v] of Object.entries(fields)) {
+          if (!info.fields || Object.hasOwn(info.fields, k)) updateFields[k] = v;
+        }
+        if (Object.keys(updateFields).length) {
+          await invokeAnki('updateNoteFields', { note: { id: noteId, fields: updateFields } }, config, fetchImpl);
+        }
         await invokeAnki('addTags', { notes: [noteId], tags: tags.join(' ') }, config, fetchImpl);
         updated++;
       } else {
@@ -184,17 +202,18 @@ async function pushToAnki({ items, config = {}, syncAnkiWeb = false, fetchImpl =
       mappings.push({
         propositionId: item.proposition.id,
         cueId: item.cue.id,
-        anki: { noteId, deckName: targetDeck, syncedHash: hash, lastSyncedAt: now },
+        anki: { noteId, deckName: targetDeck, modelName: info.modelName || spec.ankiModel, syncedHash: hash, lastSyncedAt: now },
       });
     } else {
       toCreate.push({
         item,
         targetDeck,
+        modelName: spec.ankiModel,
         hash,
         note: {
           deckName: targetDeck,
-          modelName: MODEL_NAME,
-          fields: { Front: frontHtml, Back: backHtml, Proposition: propHtml },
+          modelName: spec.ankiModel,
+          fields,
           options: { allowDuplicate: true, duplicateScope: 'deck' },
           tags,
         },
@@ -217,7 +236,7 @@ async function pushToAnki({ items, config = {}, syncAnkiWeb = false, fetchImpl =
         mappings.push({
           propositionId: entry.item.proposition.id,
           cueId: entry.item.cue.id,
-          anki: { noteId, deckName: entry.targetDeck, syncedHash: entry.hash, lastSyncedAt: now },
+          anki: { noteId, deckName: entry.targetDeck, modelName: entry.modelName, syncedHash: entry.hash, lastSyncedAt: now },
         });
       } else {
         failed++;
@@ -250,8 +269,9 @@ function extractNoteQuestionAnswer(noteInfo, cardInfo) {
   const firstVal = entries[0] ? String(entries[0][1]?.value ?? '') : '';
   const secondVal = entries[1] ? String(entries[1][1]?.value ?? '') : '';
   const propVal = fieldByName('Proposition');
+  const cardType = detectCardTypeFromAnkiModel(noteInfo.modelName, false, entries.map(([k]) => k), firstVal);
 
-  if (hasClozeSyntax(firstVal)) {
+  if (cardType === 'cloze' || hasClozeSyntax(firstVal)) {
     const expanded = expandClozeCards(firstVal, secondVal);
     const ord = Number(cardInfo?.ord ?? 0);
     const matched = expanded.find(c => c.clozeIndex === ord + 1) || expanded[ord] || expanded[0];
@@ -260,16 +280,18 @@ function extractNoteQuestionAnswer(noteInfo, cardInfo) {
         name: ankiHtmlToMarkdown(propVal) || matched.question.slice(0, 80),
         question: matched.question,
         answer: matched.answer,
+        cardType: 'cloze',
       };
     }
   }
 
   const frontRaw = fieldByName('Front') || firstVal || String(cardInfo?.question ?? '');
   const backRaw = fieldByName('Back') || secondVal || String(cardInfo?.answer ?? '');
+  const addReverse = Boolean(fieldByName('Add Reverse').trim());
   const question = ankiHtmlToMarkdown(frontRaw);
   const answer = ankiHtmlToMarkdown(backRaw);
   const name = ankiHtmlToMarkdown(propVal) || question.split('\n')[0].slice(0, 80) || 'Anki card';
-  return { name, question, answer };
+  return { name, question, answer, cardType, ...(cardType === 'basic-optional-reversed' ? { addReverse } : {}) };
 }
 
 async function pullFromAnki({ deckNames, config = {}, includeScheduling = true, dayStart = 4, fetchImpl = globalThis.fetch }) {
@@ -288,7 +310,7 @@ async function pullFromAnki({ deckNames, config = {}, includeScheduling = true, 
     for (const card of Array.isArray(cards) ? cards : []) {
       const note = noteMap.get(card.note);
       if (!note) continue;
-      const { name, question, answer } = extractNoteQuestionAnswer(note, card);
+      const { name, question, answer, cardType, addReverse } = extractNoteQuestionAnswer(note, card);
       if (!question.trim() || !answer.trim()) continue;
       const localDeckName = stripAnkiPrefix(card.deckName || deckName, config.deckPrefix);
       const schedule = includeScheduling ? ankiScheduleToFsrs(card, now, dayStart) : null;
@@ -298,6 +320,8 @@ async function pullFromAnki({ deckNames, config = {}, includeScheduling = true, 
         name,
         question,
         answer,
+        cardType,
+        ...(addReverse !== undefined ? { addReverse } : {}),
         ankiNoteId: note.noteId,
         ankiCardId: card.cardId,
         ankiOrd: Number(card.ord ?? 0),

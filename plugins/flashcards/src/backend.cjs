@@ -5,11 +5,13 @@ const { openStore, defaults: defaultSettings } = require('./store.cjs');
 const scheduler = require('./scheduler.cjs');
 const { statistics } = require('./statistics.cjs');
 const fileGeneration = require('./file-generation.cjs');
+const cardTypesLib = require('./card-types.cjs');
 const ankiFormat = require('./anki-format.cjs');
 const ankiApkg = require('./anki-apkg.cjs');
 const ankiConnect = require('./anki-connect.cjs');
+const promptsLib = require('./generation-prompts.cjs');
 
-const { graphInstructions: instructions, graphPromptFor: promptFor } = require('./generation-prompts.cjs');
+const { graphInstructions: instructions, graphPromptFor: promptFor } = promptsLib;
 const resultSchema = {
   type: 'object', additionalProperties: false, required: ['propositions'], properties: {
     propositions: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['propositionId', 'cards'], properties: {
@@ -28,6 +30,10 @@ function requiredText(value, label) { if (typeof value !== 'string' || !value.tr
 function resolveAnkiSettings(settings = {}) {
   const base = defaultSettings();
   return {
+    generationPrompt: typeof settings.generationPrompt === 'string' ? settings.generationPrompt : base.generationPrompt,
+    generationCardTypes: Array.isArray(settings.generationCardTypes) && settings.generationCardTypes.length
+      ? cardTypesLib.normalizeCardTypesList(settings.generationCardTypes)
+      : [...base.generationCardTypes],
     ankiUrl: typeof settings.ankiUrl === 'string' && settings.ankiUrl.trim() ? settings.ankiUrl : base.ankiUrl,
     ankiApiKey: typeof settings.ankiApiKey === 'string' ? settings.ankiApiKey : base.ankiApiKey,
     ankiDeckPrefix: typeof settings.ankiDeckPrefix === 'string' ? settings.ankiDeckPrefix : base.ankiDeckPrefix,
@@ -38,6 +44,7 @@ function resolveAnkiSettings(settings = {}) {
 function validateSettings(patch, old) {
   const allowed = new Set([
     'retention', 'learningSteps', 'relearningSteps', 'dayStart', 'chunkBudget', 'modelOverride', 'thinkingOverride',
+    'generationPrompt', 'generationCardTypes',
     'ankiUrl', 'ankiApiKey', 'ankiDeckPrefix', 'ankiIncludeScheduling', 'ankiAutoPush',
   ]);
   for (const key of Object.keys(patch)) if (!allowed.has(key)) fail(`Unsupported setting: ${key}`);
@@ -51,6 +58,18 @@ function validateSettings(patch, old) {
   if (!Number.isSafeInteger(s.chunkBudget) || s.chunkBudget < 1) fail('Input budget must be a positive safe whole number.');
   if (s.modelOverride !== null && (!s.modelOverride || typeof s.modelOverride.provider !== 'string' || typeof s.modelOverride.id !== 'string')) fail('Invalid model override.');
   if (s.thinkingOverride !== undefined && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(s.thinkingOverride)) fail('Invalid thinking level.');
+  if (Object.hasOwn(patch, 'generationPrompt')) {
+    if (typeof s.generationPrompt !== 'string') fail('Generation prompt must be a string.');
+    if (s.generationPrompt.length > 32000) fail('Generation prompt must be 32,000 characters or fewer.');
+    const trimmed = s.generationPrompt.trim();
+    s.generationPrompt = trimmed === promptsLib.cardWriting.trim() ? '' : trimmed;
+  }
+  if (Object.hasOwn(patch, 'generationCardTypes')) {
+    if (!Array.isArray(s.generationCardTypes) || !s.generationCardTypes.length || s.generationCardTypes.some(id => !cardTypesLib.CARD_TYPE_MAP.has(id))) {
+      fail('Select at least one valid Anki card type.');
+    }
+    s.generationCardTypes = [...new Set(s.generationCardTypes)];
+  }
   if (Object.hasOwn(patch, 'ankiUrl')) {
     if (typeof s.ankiUrl !== 'string') fail('AnkiConnect URL must be a string.');
     s.ankiUrl = ankiConnect.validateAnkiUrl(s.ankiUrl);
@@ -194,6 +213,7 @@ function activate(ctx) {
     const settings = { ...resolveAnkiSettings(s.settings), ...s.settings };
     return {
       revision: s.revision, settings, decks, propositions, batch, statistics: statistics(s, live, now),
+      generationDefaults: { prompt: promptsLib.cardWriting, cardTypes: cardTypesLib.CARD_TYPES, presets: cardTypesLib.PROMPT_PRESETS },
       anki: { syncedCueCount, totalCueCount: liveCues.length, lastSyncedAt: s.anki?.lastSyncedAt ?? null, ...(lastAutoPushError ? { autoPushError: lastAutoPushError } : {}) },
       ...(sourceCleanupError ? { cleanupError: sourceCleanupError } : {}),
     };
@@ -222,7 +242,14 @@ function activate(ctx) {
             }
             const seen = new Set(p.cues.map(c => c.question.trim()));
             for (const card of row.cards) if (!seen.has(card.question.trim())) {
-              seen.add(card.question.trim()); p.cues.push({ id: randomUUID(), question: card.question, answer: card.answer, latestRating: null }); p.version++; added++; touchedIds.add(p.id);
+              seen.add(card.question.trim());
+              const ct = card.cardType && cardTypesLib.CARD_TYPE_MAP.has(card.cardType) ? card.cardType : undefined;
+              p.cues.push({
+                id: randomUUID(), question: card.question, answer: card.answer, latestRating: null,
+                ...(ct && ct !== 'basic' ? { cardType: ct } : {}),
+                ...(ct === 'basic-optional-reversed' && card.addReverse ? { addReverse: true } : {}),
+              });
+              p.version++; added++; touchedIds.add(p.id);
             }
           }
         } else for (const row of task.result.propositions) {
@@ -236,7 +263,15 @@ function activate(ctx) {
             p = { id: row.propositionId, origin: 'graph', name: source.node.name, statement: source.node.statement, snapshot: source.node, cues: [], schedule: scheduler.createSchedule(), firstReviewedAt: null, learningCueId: null, version: 0 };
             s.propositions[p.id] = p; destination.propositionIds.push(p.id);
           }
-          if (p) for (const card of additions) { p.cues.push({ id: randomUUID(), question: card.question, answer: card.answer, latestRating: null }); p.version++; added++; touchedIds.add(p.id); }
+          if (p) for (const card of additions) {
+            const ct = card.cardType && cardTypesLib.CARD_TYPE_MAP.has(card.cardType) ? card.cardType : undefined;
+            p.cues.push({
+              id: randomUUID(), question: card.question, answer: card.answer, latestRating: null,
+              ...(ct && ct !== 'basic' ? { cardType: ct } : {}),
+              ...(ct === 'basic-optional-reversed' && card.addReverse ? { addReverse: true } : {}),
+            });
+            p.version++; added++; touchedIds.add(p.id);
+          }
         }
         c.status = 'applied'; c.added = added; finishBatch(s, b);
       }, 'batch-changed');
@@ -274,8 +309,97 @@ function activate(ctx) {
       }
     }
   }
+  const registeredWorkers = new Set(['generate-cues-v1', 'generate-file-facts-v1']);
   ctx.cleanup(ctx.workers.register({ id: 'generate-cues-v1', instructions, resultSchema, validateResult }));
   ctx.cleanup(ctx.workers.register({ id: 'generate-file-facts-v1', instructions: fileGeneration.instructions, resultSchema: fileGeneration.resultSchema, validateResult: fileGeneration.validateResult }));
+  function buildCustomCardSchema(allowedTypes) {
+    return {
+      type: 'object', additionalProperties: false, required: ['question', 'answer'],
+      properties: {
+        question: { type: 'string', minLength: 1, pattern: '\\S' },
+        answer: { type: 'string', minLength: 1, pattern: '\\S' },
+        cardType: { type: 'string', enum: allowedTypes },
+        addReverse: { type: 'boolean' },
+      },
+    };
+  }
+  function validateCustomCardFields(card, allowedTypes) {
+    if (card.cardType !== undefined && !allowedTypes.includes(card.cardType)) {
+      fail(`Unsupported cardType "${card.cardType}". Allowed: ${allowedTypes.join(', ')}.`);
+    }
+    if (card.addReverse !== undefined && typeof card.addReverse !== 'boolean') {
+      fail('addReverse must be a boolean.');
+    }
+    if (card.cardType === 'cloze' && !ankiFormat.hasClozeSyntax(card.question)) {
+      fail('Cloze cards must include at least one {{c1::answer}} deletion in the question field.');
+    }
+  }
+  function resolveGenerationWorker(kind, settings) {
+    const resolved = resolveAnkiSettings(settings);
+    const customPrompt = resolved.generationPrompt.trim();
+    const allowedTypes = resolved.generationCardTypes;
+    const usesNonBasic = allowedTypes.length > 1 || allowedTypes[0] !== 'basic';
+    if (!customPrompt && !usesNonBasic) {
+      return kind === 'file'
+        ? { id: 'generate-file-facts-v1', instructions: fileGeneration.instructions, resultSchema: fileGeneration.resultSchema }
+        : { id: 'generate-cues-v1', instructions, resultSchema };
+    }
+    const customInstructions = promptsLib.composeCustomInstructions(kind, { customPrompt, cardTypes: allowedTypes });
+    const cardSchema = buildCustomCardSchema(allowedTypes);
+    const customSchema = kind === 'file'
+      ? {
+          type: 'object', additionalProperties: false, required: ['facts'], properties: {
+            facts: { type: 'array', items: {
+              type: 'object', additionalProperties: false, required: ['name', 'statement', 'cards'], properties: {
+                name: { type: 'string', minLength: 1, pattern: '\\S' },
+                statement: { type: 'string', minLength: 1, pattern: '\\S' },
+                cards: { type: 'array', minItems: 1, items: cardSchema },
+              },
+            } },
+          },
+        }
+      : {
+          type: 'object', additionalProperties: false, required: ['propositions'], properties: {
+            propositions: { type: 'array', items: {
+              type: 'object', additionalProperties: false, required: ['propositionId', 'cards'], properties: {
+                propositionId: { type: 'string', minLength: 1 },
+                cards: { type: 'array', items: cardSchema },
+              },
+            } },
+          },
+        };
+    const key = fingerprint({ kind, customInstructions, allowedTypes }).slice(0, 12);
+    const id = `${kind === 'file' ? 'generate-file-facts' : 'generate-cues'}-custom-${key}`;
+    if (!registeredWorkers.has(id)) {
+      const customValidator = kind === 'file'
+        ? result => {
+            if (!result || typeof result !== 'object' || Array.isArray(result) || !Array.isArray(result.facts)) fail('Return a facts array.');
+            const statements = new Set(), questions = new Set();
+            for (const fact of result.facts) {
+              if (!fact || typeof fact !== 'object') fail('Fact must be an object.');
+              requiredText(fact.name, 'Fact name'); requiredText(fact.statement, 'Fact statement');
+              const st = fact.statement.trim();
+              if (statements.has(st)) fail('Duplicate fact statement; return each distinct fact only once.');
+              statements.add(st);
+              if (!Array.isArray(fact.cards) || !fact.cards.length) fail('Each fact needs at least one card.');
+              for (const card of fact.cards) {
+                requiredText(card.question, 'Question'); requiredText(card.answer, 'Answer');
+                validateCustomCardFields(card, allowedTypes);
+                const q = card.question.trim();
+                if (questions.has(q)) fail('Duplicate question; propose a distinct useful cue.');
+                questions.add(q);
+              }
+            }
+          }
+        : (result, context) => {
+            validateResult(result, context);
+            for (const row of result.propositions) for (const card of row.cards) validateCustomCardFields(card, allowedTypes);
+          };
+      ctx.cleanup(ctx.workers.register({ id, instructions: customInstructions, resultSchema: customSchema, validateResult: customValidator }));
+      registeredWorkers.add(id);
+    }
+    return { id, instructions: customInstructions, resultSchema: customSchema };
+  }
   reconcile();
 
   async function resolveModel(settings) {
@@ -296,10 +420,16 @@ function activate(ctx) {
   function createManualCard(input, newTarget) {
     const requestId = requiredText(input.requestId, 'Request ID');
     const question = requiredText(input.question, 'Question'), answer = requiredText(input.answer, 'Answer');
+    const cardType = input.cardType === undefined ? undefined : (cardTypesLib.CARD_TYPE_MAP.has(input.cardType) ? input.cardType : fail('Invalid card type.'));
+    const addReverse = input.addReverse === undefined ? undefined : (typeof input.addReverse === 'boolean' ? input.addReverse : fail('Invalid addReverse option.'));
     const destination = newTarget
       ? { deckId: requiredText(input.deckId, 'Deck ID'), name: requiredText(input.name, 'Name').trim() }
       : { propositionId: requiredText(input.propositionId, 'Target ID') };
-    const hash = fingerprint({ kind: newTarget ? 'create-card' : 'create-cue', ...destination, question, answer });
+    const hash = fingerprint({
+      kind: newTarget ? 'create-card' : 'create-cue', ...destination, question, answer,
+      ...(cardType && cardType !== 'basic' ? { cardType } : {}),
+      ...(cardType === 'basic-optional-reversed' && addReverse ? { addReverse: true } : {}),
+    });
     const prior = store.get().creationReceipts?.find(r => r.requestId === requestId);
     if (prior) {
       if (prior.hash !== hash) fail('This request ID was already used for different work.');
@@ -315,7 +445,11 @@ function activate(ctx) {
         p = prop(s, destination.propositionId);
         if (!isLocal(p) && !graphNow().propositions.some(node => node.id === p.id)) fail('The target is no longer in the graph.');
       }
-      const cue = { id: randomUUID(), question, answer, latestRating: null };
+      const cue = {
+        id: randomUUID(), question, answer, latestRating: null,
+        ...(cardType && cardType !== 'basic' ? { cardType } : {}),
+        ...(cardType === 'basic-optional-reversed' && addReverse ? { addReverse: true } : {}),
+      };
       p.cues.push(cue); p.version++;
       s.creationReceipts ??= [];
       s.creationReceipts.push({ requestId, hash, propositionId: p.id, cueId: cue.id });
@@ -396,9 +530,25 @@ function activate(ctx) {
       p.version++;
     }); return view();
   });
-  register('save-cue', ({ propositionId, cueId, question, answer, version }) => {
+  register('save-cue', ({ propositionId, cueId, question, answer, cardType, addReverse, version }) => {
     requiredText(question, 'Question'); requiredText(answer, 'Answer');
-    change(s => { const p = prop(s, propositionId); if (p.version !== version) fail('This card changed elsewhere. Reload before saving.'); const c = p.cues.find(c => c.id === cueId && !c.deleted) ?? fail('Card not found.'); c.question = question; c.answer = answer; p.version++; });
+    if (cardType !== undefined && !cardTypesLib.CARD_TYPE_MAP.has(cardType)) fail('Invalid card type.');
+    if (addReverse !== undefined && typeof addReverse !== 'boolean') fail('Invalid addReverse option.');
+    change(s => {
+      const p = prop(s, propositionId);
+      if (p.version !== version) fail('This card changed elsewhere. Reload before saving.');
+      const c = p.cues.find(c => c.id === cueId && !c.deleted) ?? fail('Card not found.');
+      c.question = question; c.answer = answer;
+      if (cardType !== undefined) {
+        if (cardType === 'basic') { delete c.cardType; delete c.addReverse; }
+        else {
+          c.cardType = cardType;
+          if (cardType === 'basic-optional-reversed') { if (addReverse) c.addReverse = true; else delete c.addReverse; }
+          else delete c.addReverse;
+        }
+      }
+      p.version++;
+    });
     maybeAutoPush({ propositionIds: [propositionId], cueIds: [cueId] });
     return view();
   });
@@ -425,16 +575,23 @@ function activate(ctx) {
     if (activeBatch(store.get())) fail('A generation batch is already active.');
     const resolved = await resolveModel(store.get().settings);
     const state = store.get(), chunks = pack(graphNow(), propositionIds, state);
-    const plans = chunks.map(input => ({ input, prompt: promptFor(input), tokens: estimate(input) }));
+    const worker = resolveGenerationWorker('graph', state.settings);
+    const estimateFor = prompt => Math.ceil(Buffer.byteLength(worker.instructions + JSON.stringify(worker.resultSchema) + prompt, 'utf8') / 3) + 256;
+    const plans = chunks.map(input => { const p = promptFor(input); return { input, prompt: p, tokens: estimateFor(p) }; });
     const id = randomUUID();
-    preflights.set(id, { kind: 'graph', revision: state.revision, settingsHash: fingerprint(state.settings), model: resolved.spec, plans, createdAt: Date.now() });
+    preflights.set(id, { kind: 'graph', workerId: worker.id, revision: state.revision, settingsHash: fingerprint(state.settings), model: resolved.spec, plans, createdAt: Date.now() });
     for (const [key, value] of preflights) if (Date.now() - value.createdAt > 600000) preflights.delete(key);
     return { id, chunkCount: plans.length, propositionCount: new Set(propositionIds).size, estimatedTokens: plans.reduce((n, p) => n + p.tokens, 0), modelLabel: resolved.entry.name };
   });
   function rememberFilePlan(file, resolved, state, source, ranges, retryOf) {
-    const plans = fileGeneration.prepareFileChunks({ name: file.name, markdown: file.markdown, chunkBudget: state.settings.chunkBudget, ...(ranges ? { ranges } : {}) });
+    const worker = resolveGenerationWorker('file', state.settings);
+    const rawPlans = fileGeneration.prepareFileChunks({ name: file.name, markdown: file.markdown, chunkBudget: state.settings.chunkBudget, ...(ranges ? { ranges } : {}) });
+    const plans = worker.id === 'generate-file-facts-v1' ? rawPlans : rawPlans.map(p => ({
+      ...p,
+      tokens: Math.ceil(Buffer.byteLength(worker.instructions + JSON.stringify(worker.resultSchema) + p.prompt, 'utf8') / 3) + 256,
+    }));
     const id = randomUUID(), sourceId = source?.id ?? randomUUID(), deckId = source?.deckId ?? randomUUID();
-    preflights.set(id, { kind: 'file', file, sourceId, deckId, retryOf, revision: state.revision, settingsHash: fingerprint(state.settings), model: resolved.spec, plans, createdAt: Date.now() });
+    preflights.set(id, { kind: 'file', workerId: worker.id, file, sourceId, deckId, retryOf, revision: state.revision, settingsHash: fingerprint(state.settings), model: resolved.spec, plans, createdAt: Date.now() });
     for (const [key, value] of preflights) if (Date.now() - value.createdAt > 600000) preflights.delete(key);
     return { id, kind: 'file', name: file.name, chunkCount: plans.length, estimatedTokens: plans.reduce((n, p) => n + p.tokens, 0), modelLabel: resolved.entry.name };
   }
@@ -514,7 +671,7 @@ function activate(ctx) {
           if (store.get().batches.find(b => b.id === batchId).cancelRequested) return;
           const p = plan.plans[index];
           // Leave output sizing and context fit to native Pi/provider handling.
-          const task = ctx.workers.start(plan.kind === 'file' ? 'generate-file-facts-v1' : 'generate-cues-v1', { requestId: chunk.requestId, input: plan.kind === 'file' ? { ...p.input, sourceId: plan.sourceId } : p.input, prompt: p.prompt, model: plan.model, purpose: 'user', options: { timeoutMs: 120000, maxRetries: 0 } });
+          const task = ctx.workers.start(plan.workerId || (plan.kind === 'file' ? 'generate-file-facts-v1' : 'generate-cues-v1'), { requestId: chunk.requestId, input: plan.kind === 'file' ? { ...p.input, sourceId: plan.sourceId } : p.input, prompt: p.prompt, model: plan.model, purpose: 'user', options: { timeoutMs: 120000, maxRetries: 0 } });
           change(s => { const c = s.batches.find(b => b.id === batchId).chunks.find(c => c.id === chunk.id); c.taskId = task.id; c.status = 'queued'; }, 'batch-changed');
           watch(batchId, chunk.id, task.id);
         } catch (error) {
@@ -597,7 +754,15 @@ function activate(ctx) {
     const chosen = ([1, 3].includes(p.schedule.state) && active.find(c => c.id === p.learningCueId)) || scheduler.chooseCue(active);
     const id = randomUUID();
     tickets.set(id, { id, propositionId: p.id, cueId: chosen.id, version: p.version, settingsHash: reviewConfiguration(s.settings), day: scheduler.studyDay(now, s.settings.dayStart), scope: structuredClone(scope), admittingDeckId, revealed: false });
-    return { ticket: { id, propositionId: p.id, cueId: chosen.id, question: chosen.question, propositionName: p.name }, remaining };
+    const cardType = cardTypesLib.inferCardTypeFromCue(chosen);
+    return {
+      ticket: {
+        id, propositionId: p.id, cueId: chosen.id, question: chosen.question, propositionName: p.name,
+        ...(cardType !== 'basic' ? { cardType } : {}),
+        ...(chosen.addReverse ? { addReverse: true } : {}),
+      },
+      remaining,
+    };
   });
   register('reveal-review', ({ ticketId }) => {
     const now = Date.now();
@@ -742,6 +907,8 @@ function activate(ctx) {
         question,
         answer,
         latestRating: null,
+        ...(item.cardType && item.cardType !== 'basic' ? { cardType: item.cardType } : {}),
+        ...(item.cardType === 'basic-optional-reversed' && item.addReverse ? { addReverse: true } : {}),
         anki: {
           ...(Number.isSafeInteger(item.ankiNoteId) ? { noteId: item.ankiNoteId } : {}),
           ...(Number.isSafeInteger(item.ankiCardId) ? { cardId: item.ankiCardId } : {}),

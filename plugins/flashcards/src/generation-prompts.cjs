@@ -133,6 +133,38 @@ const compose = sourceInstructions => [
 const graphInstructions = compose(graphSourceInstructions);
 const fileInstructions = compose(fileSourceInstructions);
 
+const CARD_TYPE_RULES = {
+  basic: '- "basic": Standard Front (question) -> Back (answer) card.',
+  'basic-reversed': '- "basic-reversed": Bidirectional card tested both Front -> Back and Back -> Front; keep both sides concise and symmetric so the reverse direction is unambiguous.',
+  'basic-optional-reversed': '- "basic-optional-reversed": Front -> Back card with optional boolean "addReverse": true when the reverse direction is also clear and useful.',
+  'basic-type-answer': '- "basic-type-answer": Exact typed-recall card; keep "answer" short, canonical, and single-line (e.g. a term, formula, command, or value) so character-level comparison is fair.',
+  cloze: '- "cloze": Fill-in-the-blank card. Put the complete statement with Anki cloze deletions {{c1::answer}} or {{c1::answer::hint}} in "question", and concise context or explanation in "answer".',
+};
+
+function cardTypesInstructions(cardTypes) {
+  const list = Array.isArray(cardTypes) && cardTypes.length ? cardTypes : ['basic'];
+  const lines = [
+    `Allowed cardType values for generated cards: ${list.map(t => `"${t}"`).join(', ')}.`,
+    'Set "cardType" on each card to the single best matching type from the allowed list above:',
+    ...list.map(t => CARD_TYPE_RULES[t]).filter(Boolean),
+  ];
+  return lines.join('\n');
+}
+
+function composeCustomInstructions(kind, { customPrompt = '', cardTypes = ['basic'] } = {}) {
+  const sourceInstructions = kind === 'file' ? fileSourceInstructions : graphSourceInstructions;
+  const writing = typeof customPrompt === 'string' && customPrompt.trim() ? customPrompt.trim() : cardWriting;
+  const normalizedTypes = Array.isArray(cardTypes) && cardTypes.length ? cardTypes : ['basic'];
+  const hasNonBasic = normalizedTypes.some(t => t !== 'basic') || normalizedTypes.length > 1;
+  return [
+    '## Source-specific task', sourceInstructions,
+    '## Card writing', writing,
+    ...(hasNonBasic ? ['## Card types', cardTypesInstructions(normalizedTypes)] : []),
+    '## Input safety', inputSafety,
+    '## Formatting and completion', outputProtocol,
+  ].join('\n\n');
+}
+
 // Keep task-specific payloads separate; neither path serializes source data into
 // its system instructions. JSON quoting remains unchanged by prompt composition.
 const graphPromptFor = input => `Generate additive fact-recall cards for this JSON input:\n${JSON.stringify({ targets: input.targets, propositions: input.propositions, chains: input.chains, cards: input.cards.map(({ propositionId, active }) => ({ propositionId, active })) })}`;
@@ -141,4 +173,5 @@ const filePromptFor = input => `Extract supported atomic facts and distinct fact
 module.exports = {
   cardWriting, inputSafety, outputProtocol, graphSourceInstructions, fileSourceInstructions,
   graphInstructions, fileInstructions, graphPromptFor, filePromptFor,
+  cardTypesInstructions, composeCustomInstructions,
 };

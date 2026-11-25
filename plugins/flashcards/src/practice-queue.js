@@ -14,7 +14,11 @@ export function buildPracticeCards(state, scope = {}) {
       for (const cue of p.cues) {
         if (cue.deleted || seen.has(cue.id) || (cues && !cues.has(cue.id))) continue;
         seen.add(cue.id);
-        cards.push({ propositionId: p.id, cueId: cue.id, propositionName: p.name, question: cue.question, answer: cue.answer });
+        cards.push({
+          propositionId: p.id, cueId: cue.id, propositionName: p.name, question: cue.question, answer: cue.answer,
+          ...(cue.cardType && cue.cardType !== 'basic' ? { cardType: cue.cardType } : {}),
+          ...(cue.addReverse ? { addReverse: true } : {}),
+        });
       }
     }
   }

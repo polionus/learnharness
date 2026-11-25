@@ -1,5 +1,6 @@
 'use strict';
 const { createHash } = require('node:crypto');
+const { CARD_TYPES, cardTypeInfo, inferCardTypeFromCue } = require('./card-types.cjs');
 
 const MODEL_NAME = 'LearnHarness Basic';
 const MODEL_CSS = [
@@ -13,11 +14,120 @@ const MODEL_CSS = [
   'table { border-collapse: collapse; margin: 12px 0; width: 100%; }',
   'th, td { border: 1px solid rgba(128,128,128,0.3); padding: 6px 10px; text-align: left; }',
   'blockquote { border-left: 3px solid rgba(128,128,128,0.4); margin: 10px 0; padding: 2px 12px; opacity: 0.9; }',
+  '.cloze { font-weight: 700; color: #2563eb; }',
+  '.nightMode .cloze, .night_mode .cloze { color: #60a5fa; }',
   '.lh-prop { margin-top: 18px; font-size: 12px; color: #78716c; }',
 ].join('\n');
 
 const FRONT_TEMPLATE = '{{Front}}';
 const BACK_TEMPLATE = '{{FrontSide}}<hr id="answer">{{Back}}{{#Proposition}}<div class="lh-prop">{{Proposition}}</div>{{/Proposition}}';
+
+function ankiModelSpec(cardType) {
+  const info = cardTypeInfo(cardType);
+  if (info.id === 'basic-reversed') {
+    return {
+      ...info,
+      fields: ['Front', 'Back', 'Proposition'],
+      templates: [
+        { Name: 'Card 1', Front: '{{Front}}', Back: '{{FrontSide}}<hr id="answer">{{Back}}{{#Proposition}}<div class="lh-prop">{{Proposition}}</div>{{/Proposition}}' },
+        { Name: 'Card 2', Front: '{{Back}}', Back: '{{FrontSide}}<hr id="answer">{{Front}}{{#Proposition}}<div class="lh-prop">{{Proposition}}</div>{{/Proposition}}' },
+      ],
+    };
+  }
+  if (info.id === 'basic-optional-reversed') {
+    return {
+      ...info,
+      fields: ['Front', 'Back', 'Add Reverse', 'Proposition'],
+      templates: [
+        { Name: 'Card 1', Front: '{{Front}}', Back: '{{FrontSide}}<hr id="answer">{{Back}}{{#Proposition}}<div class="lh-prop">{{Proposition}}</div>{{/Proposition}}' },
+        { Name: 'Card 2', Front: '{{#Add Reverse}}{{Back}}{{/Add Reverse}}', Back: '{{FrontSide}}<hr id="answer">{{Front}}{{#Proposition}}<div class="lh-prop">{{Proposition}}</div>{{/Proposition}}' },
+      ],
+    };
+  }
+  if (info.id === 'basic-type-answer') {
+    return {
+      ...info,
+      fields: ['Front', 'Back', 'Proposition'],
+      templates: [
+        { Name: 'Card 1', Front: '{{Front}}<br><br>{{type:Back}}', Back: '{{Front}}<hr id="answer">{{type:Back}}{{#Proposition}}<div class="lh-prop">{{Proposition}}</div>{{/Proposition}}' },
+      ],
+    };
+  }
+  if (info.id === 'cloze') {
+    return {
+      ...info,
+      fields: ['Text', 'Back Extra', 'Proposition'],
+      templates: [
+        { Name: 'Cloze', Front: '{{cloze:Text}}', Back: '{{cloze:Text}}<br><br>{{Back Extra}}{{#Proposition}}<div class="lh-prop">{{Proposition}}</div>{{/Proposition}}' },
+      ],
+    };
+  }
+  return {
+    ...info,
+    fields: ['Front', 'Back', 'Proposition'],
+    templates: [
+      { Name: 'Card 1', Front: FRONT_TEMPLATE, Back: BACK_TEMPLATE },
+    ],
+  };
+}
+
+function buildAnkiFieldsForCue(cue, proposition) {
+  const cardType = inferCardTypeFromCue(cue);
+  const spec = ankiModelSpec(cardType);
+  const propHtml = proposition?.name ? markdownToAnkiHtml(proposition.name) : '';
+  if (cardType === 'cloze') {
+    const rawQuestion = String(cue.question ?? '');
+    const textHtml = hasClozeSyntax(rawQuestion)
+      ? markdownToAnkiHtml(rawQuestion)
+      : markdownToAnkiHtml(`${rawQuestion} {{c1::${String(cue.answer ?? '').trim()}}}`);
+    const extraHtml = hasClozeSyntax(rawQuestion) ? markdownToAnkiHtml(cue.answer) : '';
+    return { cardType, spec, fields: { Text: textHtml, 'Back Extra': extraHtml, Proposition: propHtml } };
+  }
+  if (cardType === 'basic-optional-reversed') {
+    return {
+      cardType,
+      spec,
+      fields: {
+        Front: markdownToAnkiHtml(cue.question),
+        Back: markdownToAnkiHtml(cue.answer),
+        'Add Reverse': cue.addReverse ? 'yes' : '',
+        Proposition: propHtml,
+      },
+    };
+  }
+  if (cardType === 'basic-type-answer') {
+    // Anki's {{type:Back}} compares plain text, so keep Back cleanly escaped without extra block wrappers when simple.
+    const rawAns = String(cue.answer ?? '').trim();
+    const isSimple = !rawAns.includes('\n') && !/[`*_[\]$]/.test(rawAns);
+    return {
+      cardType,
+      spec,
+      fields: {
+        Front: markdownToAnkiHtml(cue.question),
+        Back: isSimple ? escapeHtml(rawAns) : markdownToAnkiHtml(rawAns),
+        Proposition: propHtml,
+      },
+    };
+  }
+  return {
+    cardType,
+    spec,
+    fields: {
+      Front: markdownToAnkiHtml(cue.question),
+      Back: markdownToAnkiHtml(cue.answer),
+      Proposition: propHtml,
+    },
+  };
+}
+
+function detectCardTypeFromAnkiModel(modelName, isCloze, fieldNames = [], rawFirstField = '') {
+  const lower = String(modelName || '').toLowerCase();
+  if (isCloze || lower.includes('cloze') || hasClozeSyntax(rawFirstField)) return 'cloze';
+  if (lower.includes('type in the answer') || lower.includes('type-answer')) return 'basic-type-answer';
+  if (lower.includes('optional reversed') || fieldNames.some(f => f.toLowerCase() === 'add reverse')) return 'basic-optional-reversed';
+  if (lower.includes('and reversed') || lower.includes('reversed')) return 'basic-reversed';
+  return 'basic';
+}
 
 function escapeHtml(text) {
   return String(text ?? '')
@@ -298,9 +408,9 @@ function stripAnkiPrefix(deckName, prefix) {
   return cleanDeck;
 }
 
-function cueFingerprint(question, answer, propositionName, deckName) {
+function cueFingerprint(question, answer, propositionName, deckName, cardType = 'basic', addReverse = false) {
   return createHash('sha256')
-    .update(JSON.stringify([question ?? '', answer ?? '', propositionName ?? '', deckName ?? '']))
+    .update(JSON.stringify([question ?? '', answer ?? '', propositionName ?? '', deckName ?? '', cardType ?? 'basic', Boolean(addReverse)]))
     .digest('hex');
 }
 
@@ -433,10 +543,14 @@ function fsrsToAnkiCardState(schedule, now = Date.now(), collectionCrtSec = Math
 }
 
 module.exports = {
+  CARD_TYPES,
   MODEL_NAME,
   MODEL_CSS,
   FRONT_TEMPLATE,
   BACK_TEMPLATE,
+  ankiModelSpec,
+  buildAnkiFieldsForCue,
+  detectCardTypeFromAnkiModel,
   escapeHtml,
   unescapeHtml,
   markdownToAnkiHtml,

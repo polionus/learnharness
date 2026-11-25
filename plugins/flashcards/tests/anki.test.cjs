@@ -654,3 +654,220 @@ test('Flashcards generation renders animated progress bar, chunk segments, elaps
     h.dispose();
   }
 });
+
+test('all 5 standard Anki basic card types export accurately to APKG and AnkiConnect', async t => {
+  const mock = createMockAnkiServer();
+  const h = createBackendHarness(t, { ankiFetch: mock.fetchImpl });
+  await h.call('create-deck', { name: 'All Types' });
+  const deckId = h.state().decks[0].id;
+
+  await h.call('create-card', { deckId, name: 'Plain', question: 'Q basic?', answer: 'A basic', cardType: 'basic', requestId: 'ct-1' });
+  await h.call('create-card', { deckId, name: 'Rev', question: 'Bonjour', answer: 'Hello', cardType: 'basic-reversed', requestId: 'ct-2' });
+  await h.call('create-card', { deckId, name: 'OptRevOn', question: 'H2O', answer: 'Water', cardType: 'basic-optional-reversed', addReverse: true, requestId: 'ct-3' });
+  await h.call('create-card', { deckId, name: 'OptRevOff', question: 'One-way fact', answer: 'Detail', cardType: 'basic-optional-reversed', addReverse: false, requestId: 'ct-4' });
+  await h.call('create-card', { deckId, name: 'TypeAns', question: 'Git command to stage?', answer: 'git add', cardType: 'basic-type-answer', requestId: 'ct-5' });
+  await h.call('create-card', { deckId, name: 'ClozeCard', question: 'Water boils at {{c1::100°C}} at {{c2::1 atm}}.', answer: 'Sea-level boiling point', cardType: 'cloze', requestId: 'ct-6' });
+
+  // Export .apkg and verify exact note & card counts:
+  // basic(1) + reversed(2) + optRevOn(2) + optRevOff(1) + typeAns(1) + cloze(2) = 9 cards across 6 notes!
+  const exported = await h.call('anki-export-apkg', { includeScheduling: false });
+  assert.equal(exported.noteCount, 6);
+  assert.equal(exported.cardCount, 9);
+
+  // Inspect SQLite models inside exported .apkg.
+  const entries = readZip(Buffer.from(exported.base64, 'base64'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lh-5types-'));
+  try {
+    const dbPath = path.join(tmpDir, 'col.sqlite');
+    fs.writeFileSync(dbPath, entries.get('collection.anki2'));
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    const col = db.prepare('SELECT models FROM col LIMIT 1').get();
+    const models = Object.values(JSON.parse(col.models));
+    assert.equal(models.length, 5);
+    assert.ok(models.some(m => m.name === 'LearnHarness Basic (and reversed)' && m.tmpls.length === 2));
+    assert.ok(models.some(m => m.name === 'LearnHarness Basic (type in the answer)' && m.tmpls[0].qfmt.includes('{{type:Back}}')));
+    assert.ok(models.some(m => m.name === 'LearnHarness Cloze' && m.type === 1 && m.tmpls[0].qfmt.includes('{{cloze:Text}}')));
+    db.close();
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // Push all 5 types to AnkiConnect and confirm all 5 models are created.
+  const pushed = await h.call('anki-sync-push', {});
+  assert.equal(pushed.summary.created, 6);
+  assert.ok(mock.models.has('LearnHarness Basic'));
+  assert.ok(mock.models.has('LearnHarness Basic (and reversed)'));
+  assert.ok(mock.models.has('LearnHarness Basic (optional reversed)'));
+  assert.ok(mock.models.has('LearnHarness Basic (type in the answer)'));
+  assert.ok(mock.models.has('LearnHarness Cloze'));
+});
+
+test('custom system prompt and selected card types register a custom generation worker and persist card types', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'flashcards-custom-prompt-'));
+  const registered = new Map();
+  const tasks = new Map();
+  const waiters = new Map();
+  const handlers = new Map();
+  const cleanups = [];
+  const controller = new AbortController();
+
+  const workers = {
+    register(def) { registered.set(def.id, def); return () => registered.delete(def.id); },
+    start(workerId, options) {
+      assert.ok(registered.has(workerId), `Worker ${workerId} must be registered`);
+      const task = { id: `t-${tasks.size + 1}`, workerId, requestId: options.requestId, input: options.input, status: 'running', turns: 0 };
+      tasks.set(task.id, task);
+      return structuredClone(task);
+    },
+    list: () => structuredClone([...tasks.values()]),
+    get: id => structuredClone(tasks.get(id)),
+    subscribe: () => () => {},
+    wait: id => new Promise(resolve => {
+      if (tasks.get(id).status === 'succeeded') return resolve();
+      waiters.set(id, resolve);
+    }),
+    cancel() {},
+  };
+
+  activate({
+    dataDirectory: directory,
+    signal: controller.signal,
+    workers,
+    learning: { graph: () => ({ propositions: [{ id: 'p1', name: 'TCP', statement: 'TCP guarantees ordered delivery.', provenance: [{ chatId: 'c1' }] }], chains: [], sessions: { c1: 'Networking' }, fileSources: {} }) },
+    inference: { catalog: async () => ({ slots: { cheap: { model: { provider: 'mock', id: 'cheap' } } }, models: [{ provider: 'mock', id: 'cheap', name: 'Mock', supportedLevels: ['off'] }] }) },
+    events: { emit() {} },
+    handle: (name, fn) => handlers.set(name, fn),
+    cleanup: fn => cleanups.push(fn),
+  });
+  t.after(() => {
+    for (const fn of cleanups.splice(0).reverse()) fn();
+    controller.abort();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const call = (name, input = {}) => handlers.get(name)(input);
+  await call('save-settings', {
+    generationPrompt: 'Focus on short cloze and type-in cards for networking protocols.',
+    generationCardTypes: ['cloze', 'basic-type-answer'],
+  });
+  const plan = await call('preflight', { propositionIds: ['p1'] });
+  await call('start-generation', { preflightId: plan.id, requestId: 'gen-custom-1' });
+  await new Promise(resolve => setImmediate(resolve));
+
+  const [task] = [...tasks.values()];
+  assert.ok(task.workerId.startsWith('generate-cues-custom-'));
+  const def = registered.get(task.workerId);
+  assert.ok(def.instructions.includes('Focus on short cloze and type-in cards for networking protocols.'));
+  assert.ok(def.instructions.includes('"cloze"') && def.instructions.includes('"basic-type-answer"'));
+
+  // Validator rejects cloze card missing {{c1::...}} syntax.
+  assert.throws(() => def.validateResult({
+    propositions: [{ propositionId: 'p1', cards: [{ question: 'Missing cloze syntax', answer: 'TCP', cardType: 'cloze' }] }],
+  }, { input: task.input }), /\{\{c1::answer\}\}/);
+
+  // Valid custom result persists cardType cleanly.
+  const validResult = {
+    propositions: [{
+      propositionId: 'p1',
+      cards: [
+        { question: '{{c1::TCP}} guarantees ordered byte-stream delivery.', answer: 'Transport layer', cardType: 'cloze' },
+        { question: 'Which protocol guarantees ordered delivery?', answer: 'TCP', cardType: 'basic-type-answer' },
+      ],
+    }],
+  };
+  def.validateResult(validResult, { input: task.input });
+  task.status = 'succeeded';
+  task.result = validResult;
+  waiters.get(task.id)?.();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const state = call('get-state');
+  assert.deepEqual(state.propositions[0].cues.map(c => c.cardType), ['cloze', 'basic-type-answer']);
+});
+
+test('UI exposes study summary strip, prompt editor, card-type pickers, and interactive type-answer & cloze review', async () => {
+  const source = buildSync({
+    entryPoints: [path.join(__dirname, '../src/main.js')],
+    bundle: true,
+    platform: 'browser',
+    format: 'esm',
+    write: false,
+  }).outputFiles[0].text;
+  const moduleUrl = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
+  const document = createDocument();
+  const { activate: activateUi } = await import(moduleUrl);
+  const h = fixture(document);
+  h.state.generationDefaults = {
+    prompt: 'Default canonical card-writing instructions.',
+    presets: [{ id: 'cloze-heavy', label: 'Cloze-Heavy', description: 'Cloze preset', cardTypes: ['cloze', 'basic'], prompt: 'Use cloze deletions!' }],
+  };
+  h.state.settings.generationPrompt = '';
+  h.state.settings.generationCardTypes = ['basic'];
+  h.state.propositions[0].cues.push(
+    { id: 'c-type', question: 'Command to list files?', answer: 'ls', cardType: 'basic-type-answer' },
+    { id: 'c-cloze', question: 'Earth orbits the {{c1::Sun::star}}.', answer: 'Solar system', cardType: 'cloze' },
+  );
+  h.overrides['next-review'] = async () => ({
+    ticket: { id: 't-type', propositionId: 'p1', cueId: 'c-type', question: 'Command to list files?', propositionName: 'Fact one', cardType: 'basic-type-answer' },
+    remaining: 1,
+  });
+  h.overrides['reveal-review'] = async () => ({ answer: 'ls', intervals: { 1: 60000, 2: 300000, 3: 600000, 4: 86400000 } });
+
+  activateUi(h.ctx);
+  h.mount();
+  await flush();
+  try {
+    // 1. Summary strip shows live counts.
+    const summary = h.app.querySelector('.fc-summary-strip');
+    assert.ok(summary);
+    assert.ok(summary.textContent.includes('Due now'));
+    assert.ok(summary.textContent.includes('Total cues'));
+
+    // 2. Prompt panel toggles card types and opens system prompt editor.
+    const promptPanel = h.app.querySelector('.fc-prompt-panel');
+    assert.ok(promptPanel);
+    const clozeToggle = promptPanel.querySelector('button[data-card-type="cloze"]');
+    assert.ok(clozeToggle);
+    clozeToggle.click();
+    await flush();
+    const saveCall = h.calls.findLast(([op]) => op === 'save-settings');
+    assert.deepEqual(saveCall[1].generationCardTypes, ['basic', 'cloze']);
+
+    const editPromptBtn = [...promptPanel.querySelectorAll('button')].find(b => b.textContent === 'Edit system prompt…');
+    editPromptBtn.click();
+    const dlg = document.querySelector('[role=dialog]');
+    assert.equal(dlg.getAttribute('aria-label'), 'Generation system prompt & card types');
+    const presetBtn = [...dlg.querySelectorAll('button')].find(b => b.textContent === 'Cloze-Heavy');
+    presetBtn.click();
+    const textarea = dlg.querySelector('textarea.fc-prompt-textarea');
+    assert.equal(textarea.value, 'Use cloze deletions!');
+    const savePromptBtn = [...dlg.querySelectorAll('button')].find(b => b.textContent === 'Save prompt');
+    savePromptBtn.click();
+    await flush();
+    const promptSave = h.calls.findLast(([op]) => op === 'save-settings');
+    assert.equal(promptSave[1].generationPrompt, 'Use cloze deletions!');
+
+    // 3. Interactive type-in-the-answer review shows diff on reveal.
+    const reviewBtn = [...summary.querySelectorAll('button')].find(b => b.textContent.startsWith('Review due'));
+    reviewBtn.click();
+    await flush();
+    const surface = h.handles.findLast(handle => handle.kind === 'surface' && !handle.disposed).container;
+    const typeInput = surface.querySelector('input.fc-type-answer-input');
+    assert.ok(typeInput, 'type-answer card shows text input before reveal');
+    typeInput.value = 'ls';
+    const revealBtn = [...surface.querySelectorAll('button')].find(b => b.textContent === 'Reveal answer');
+    revealBtn.click();
+    await flush();
+    const diffBox = surface.querySelector('.fc-type-diff');
+    assert.ok(diffBox);
+    assert.equal(diffBox.dataset.exact, 'true');
+    assert.ok(diffBox.textContent.includes('Exact match'));
+
+    // 4. Settings mounts inline system prompt editor.
+    h.mountSettings();
+    await flush();
+    assert.ok(h.settings.querySelector('.fc-prompt-settings textarea.fc-prompt-textarea'));
+  } finally {
+    h.dispose();
+  }
+});
